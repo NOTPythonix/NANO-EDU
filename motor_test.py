@@ -739,26 +739,64 @@ def _ramp_signed(current: float, target: float, dt_s: float) -> float:
 
 
 def run_test(motors: List[Motor]) -> int:
-    print("Starting L298N motor test (forward + reverse per motor)...")
-    print(f"ON_TIME_S={ON_TIME_S}  OFF_TIME_S={OFF_TIME_S}  REPEATS={REPEATS_PER_MOTOR}  SPEED={DEFAULT_SPEED}")
+    print("Starting L298N motor test (ramp up/down forward + reverse per motor)...")
+    print(f"ON_TIME_S={ON_TIME_S}  OFF_TIME_S={OFF_TIME_S}  PEAK_SPEED={DEFAULT_SPEED}")
 
-    for motor in motors:
-        print(f"\nTesting {motor.pins.name}...")
-        for i in range(REPEATS_PER_MOTOR):
-            print(f"  Cycle {i + 1}/{REPEATS_PER_MOTOR}: FORWARD")
-            motor.set(+DEFAULT_SPEED)
-            time.sleep(ON_TIME_S)
+    # Small timestep for smooth ramping.
+    step_s = 0.02
+
+    def ramp_run(motor: Motor, peak_speed: float, total_s: float) -> None:
+        total_s = max(0.0, float(total_s))
+        if total_s <= 0.0 or abs(peak_speed) < 1e-6:
             motor.stop()
+            return
+
+        up_s = total_s / 2.0
+        down_s = total_s - up_s
+
+        # Ramp up
+        t0 = time.time()
+        while True:
+            t = time.time() - t0
+            if t >= up_s:
+                break
+            frac = 0.0 if up_s <= 1e-9 else (t / up_s)
+            motor.set(peak_speed * frac)
+            time.sleep(step_s)
+
+        motor.set(peak_speed)
+
+        # Ramp down
+        t0 = time.time()
+        while True:
+            t = time.time() - t0
+            if t >= down_s:
+                break
+            frac = 0.0 if down_s <= 1e-9 else (1.0 - (t / down_s))
+            motor.set(peak_speed * frac)
+            time.sleep(step_s)
+
+        motor.stop()
+
+    try:
+        for motor in motors:
+            print(f"\nTesting {motor.pins.name}...")
+
+            print("  FORWARD (ramp up then down)")
+            ramp_run(motor, +DEFAULT_SPEED, ON_TIME_S)
             time.sleep(OFF_TIME_S)
 
-            print("  REVERSE")
-            motor.set(-DEFAULT_SPEED)
-            time.sleep(ON_TIME_S)
-            motor.stop()
+            print("  REVERSE (ramp up then down)")
+            ramp_run(motor, -DEFAULT_SPEED, ON_TIME_S)
             time.sleep(OFF_TIME_S)
 
-    print("\nDone.")
-    return 0
+        print("\nDone.")
+        return 0
+    except KeyboardInterrupt:
+        for motor in motors:
+            motor.stop()
+        print("\nInterrupted. Motors stopped.")
+        return 130
 
 
 def run_teleop(motors: List[Motor], input_mode: InputMode, full_speed: bool) -> int:
