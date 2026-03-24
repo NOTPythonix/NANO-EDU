@@ -187,7 +187,17 @@ class PynputKeys:
                 self._pressed.discard(k)
             self._events.put(("up", k))
 
-        self._listener = kb.Listener(on_press=on_press, on_release=on_release)
+        listener_kwargs: Dict[str, Any] = {"on_press": on_press, "on_release": on_release}
+        if sys.platform.startswith("linux"):
+            # On Linux terminals, arrow keys can also be interpreted by the TTY,
+            # causing viewport jitter while the TUI is running.
+            listener_kwargs["suppress"] = True
+
+        try:
+            self._listener = kb.Listener(**listener_kwargs)
+        except TypeError:
+            listener_kwargs.pop("suppress", None)
+            self._listener = kb.Listener(**listener_kwargs)
         self._listener.start()
 
     def stop(self) -> None:
