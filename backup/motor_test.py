@@ -20,14 +20,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import glob
 import os
-import shutil
 import signal
 import sys
 import threading
 import time
-from typing import List, Literal, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 # -----------------------
 # Wiring constants (EDIT)
@@ -100,10 +98,6 @@ REV_ACCEL_PER_S = 1.0
 DECEL_PER_S = 2.5
 
 COAST_ON_STOP = True
-
-# Legacy repeat-timeout backend tuning (only used if --input repeat).
-THROTTLE_HOLD_TIMEOUT_S = 0.05
-STEER_HOLD_TIMEOUT_S = 0.05
 
 # Steering mix: higher = sharper turns while moving.
 STEER_GAIN = 0.70
@@ -346,54 +340,6 @@ def _fmt_motor_pins(motors: Sequence[MotorPins]) -> str:
     return ", ".join(f"{m.name}: EN={m.en} IN1={m.in1} IN2={m.in2}{' (inv)' if m.invert else ''}" for m in motors)
 
 
-def _read_key_nonblocking() -> str | None:
-    """Return a single key press (lowercased) if available, else None.
-
-    Supports Windows (msvcrt) and Linux/macOS terminals.
-    """
-    if os.name == "nt":
-        try:
-            import msvcrt  # type: ignore
-
-            if not msvcrt.kbhit():
-                return None
-            ch = msvcrt.getwch()
-            return ch.lower()
-        except Exception:
-            return None
-
-    try:
-        import select
-        import termios
-        import tty
-
-        if not sys.stdin or not hasattr(sys.stdin, "fileno"):
-            return None
-        try:
-            if not sys.stdin.isatty():
-                return None
-        except Exception:
-            return None
-
-        fd = sys.stdin.fileno()
-        r, _, _ = select.select([fd], [], [], 0)
-        if not r:
-            return None
-
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            data = os.read(fd, 1)
-            if not data:
-                return None
-            ch = data.decode(errors="ignore")
-            return ch.lower()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
-        return None
-
-
 @dataclass
 class InputState:
     w: bool = False
@@ -404,10 +350,6 @@ class InputState:
     q: bool = False
     slower: bool = False  # '['
     faster: bool = False  # ']'
-
-
-InputMode = Literal["auto", "pynput", "keyboard", "repeat"]
-
 
 class _NoEchoTerminal:
     """Context manager to disable input echo on POSIX terminals.
@@ -483,143 +425,6 @@ class _InputBackend:
     def get_state(self) -> InputState:
         raise NotImplementedError
 
-
-class _RepeatBackend(_InputBackend):
-    """Terminal polling backend (legacy). Still relies on timeouts + key repeat."""
-
-    def __init__(self):
-        self._throttle = 0.0
-        self._steer = 0.0
-        self._speed_down = False
-        self._speed_up = False
-        self._quit = False
-        self._space = False
-        self._last_throttle_t = 0.0
-        self._last_steer_t = 0.0
-
-    def get_state(self) -> InputState:
-        key = _read_key_nonblocking()
-        now = time.time()
-        self._speed_down = False
-        self._speed_up = False
-        self._space = False
-
-        if key is not None:
-            if key == "q":
-                self._quit = True
-            elif key == "w":
-                self._throttle = 1.0
-                self._last_throttle_t = now
-            elif key == "s":
-                self._throttle = -1.0
-                self._last_throttle_t = now
-            elif key == "a":
-                self._steer = -1.0
-                self._last_steer_t = now
-            elif key == "d":
-                self._steer = 1.0
-                self._last_steer_t = now
-            elif key == " ":
-                self._throttle = 0.0
-                self._steer = 0.0
-                self._last_throttle_t = 0.0
-                self._last_steer_t = 0.0
-                self._space = True
-            elif key == "[":
-                self._speed_down = True
-            elif key == "]":
-                self._speed_up = True
-
-        if self._last_throttle_t and (now - self._last_throttle_t) > THROTTLE_HOLD_TIMEOUT_S:
-            self._throttle = 0.0
-            self._last_throttle_t = 0.0
-        if self._last_steer_t and (now - self._last_steer_t) > STEER_HOLD_TIMEOUT_S:
-            self._steer = 0.0
-            self._last_steer_t = 0.0
-
-        return InputState(
-            w=self._throttle > 0,
-            s=self._throttle < 0,
-            a=self._steer < 0,
-            d=self._steer > 0,
-            space=self._space,
-            q=self._quit,
-            slower=self._speed_down,
-            faster=self._speed_up,
-        )
-
-
-class _KeyboardModuleBackend(_InputBackend):
-    """Uses the `keyboard` module to read actual key state."""
-
-    def __init__(self):
-        try:
-            import keyboard  # type: ignore
-
-            self._kb = keyboard
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to initialize --input keyboard. On Linux this often requires running as root: "
-                "`sudo python3 motor_test.py --input keyboard` (or install/use --input pynput on desktop Linux)."
-            ) from e
-
-        # On Linux, the `keyboard` module shells out to `dumpkeys` to read keymaps.
-        # If it's missing, it will crash later with FileNotFoundError.
-        if os.name != "nt":
-            if shutil.which("dumpkeys") is None:
-                raise RuntimeError(
-                    "`--input keyboard` requires the `dumpkeys` command on Linux. "
-                    "Install your distro's `kbd` package (e.g. `sudo apt install kbd`) or use `--input repeat`. "
-                    "On desktop Linux you can also try `--input pynput`."
-                )
-
-            # The `keyboard` module reads from /dev/input/event* on Linux.
-            # Without permissions, it can appear to work but never report keys.
-            if sys.platform.startswith("linux"):
-                events = sorted(glob.glob("/dev/input/event*"))
-                if events:
-                    readable = [p for p in events if os.access(p, os.R_OK)]
-                    if not readable:
-                        raise RuntimeError(
-                            "`--input keyboard` cannot read Linux input devices (/dev/input/event*). "
-                            "This usually means you are not running with sufficient permissions.\n\n"
-                            "Fix options:\n"
-                            "  1) Run with sudo: sudo python3 motor_test.py --input keyboard\n"
-                            "  2) Add your user to the input group (distro-dependent): sudo usermod -aG input $USER\n"
-                            "     then log out/in (or reboot)\n\n"
-                            "If you're in WSL, the `keyboard` backend typically won't work; use `--input repeat` "
-                            "or run on native Windows with `--input pynput`."
-                        )
-
-    def get_state(self) -> InputState:
-        kb = self._kb
-
-        def pressed(key_name: str) -> bool:
-            try:
-                return bool(kb.is_pressed(key_name))
-            except SystemError:
-                # The `keyboard` module has some edge cases on Linux keymaps (notably '['/']')
-                # that can raise SystemError. Treat as not-pressed rather than crashing teleop.
-                return False
-            except Exception:
-                return False
-
-        # Speed keys: prefer robust names across layouts.
-        slower = pressed("down") or pressed("-") or pressed("[")
-        faster = pressed("up") or pressed("=") or pressed("]")
-
-        return InputState(
-            w=pressed("w"),
-            a=pressed("a"),
-            s=pressed("s"),
-            d=pressed("d"),
-            space=pressed("space"),
-            q=pressed("q"),
-            slower=slower,
-            faster=faster,
-        )
-
-
 class _PynputBackend(_InputBackend):
     """Uses pynput to capture key down/up events (no repeat needed)."""
 
@@ -683,35 +488,8 @@ class _PynputBackend(_InputBackend):
             faster="]" in pressed,
         )
 
-
-def _make_input_backend(mode: InputMode) -> _InputBackend:
-    if mode == "repeat":
-        return _RepeatBackend()
-
-    if mode == "keyboard":
-        return _KeyboardModuleBackend()
-
-    if mode == "pynput":
-        return _PynputBackend()
-
-    # auto
-    candidates: List[InputMode]
-    if os.name == "nt":
-        candidates = ["pynput", "keyboard", "repeat"]
-    else:
-        candidates = ["keyboard", "pynput", "repeat"]
-
-    # Avoid pynput on headless Linux where it commonly fails.
-    if os.name != "nt" and not os.environ.get("DISPLAY"):
-        candidates = [c for c in candidates if c != "pynput"] + ["repeat"]
-
-    for c in candidates:
-        try:
-            return _make_input_backend(c)
-        except Exception:
-            continue
-
-    return _RepeatBackend()
+def _make_input_backend() -> _InputBackend:
+    return _PynputBackend()
 
 
 def _ramp(current: float, target: float, max_delta: float) -> float:
@@ -799,7 +577,7 @@ def run_test(motors: List[Motor]) -> int:
         return 130
 
 
-def run_teleop(motors: List[Motor], input_mode: InputMode, full_speed: bool) -> int:
+def run_teleop(motors: List[Motor], full_speed: bool) -> int:
     name_to_motor = {m.pins.name: m for m in motors}
     left = [name_to_motor[n] for n in LEFT_MOTORS if n in name_to_motor]
     right = [name_to_motor[n] for n in RIGHT_MOTORS if n in name_to_motor]
@@ -822,51 +600,11 @@ def run_teleop(motors: List[Motor], input_mode: InputMode, full_speed: bool) -> 
     print("  ] or = or Up   = faster", flush=True)
     print("", flush=True)
 
-    backend = _make_input_backend(input_mode)
-
-    def backend_name(b: _InputBackend) -> str:
-        if isinstance(b, _PynputBackend):
-            return "pynput"
-        if isinstance(b, _KeyboardModuleBackend):
-            return "keyboard"
-        if isinstance(b, _RepeatBackend):
-            return "repeat"
-        return "unknown"
-
-    actual_input = backend_name(backend) if input_mode == "auto" else input_mode
+    backend = _make_input_backend()
+    actual_input = "pynput"
     print(f"Input backend: {actual_input}", flush=True)
 
-    if isinstance(backend, _RepeatBackend):
-        try:
-            if not sys.stdin.isatty():
-                print(
-                    "ERROR: --input repeat reads keys from the terminal, but stdin is not a TTY.\n"
-                    "Run this from an interactive terminal (VS Code Terminal / PowerShell / bash), e.g.:\n"
-                    "  python motor_test.py --dry_run --input repeat\n"
-                    "If you are clicking a Run button that uses an Output panel, it will not receive keypresses.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return 2
-        except Exception:
-            # If we can't determine TTY status, just proceed.
-            pass
-        print(
-            "Note: terminal input is captured directly; you may not see characters as you press keys. "
-            "Use W/A/S/D + Space + Q as controls.",
-            flush=True,
-        )
-
     backend.start()
-
-    if input_mode == "auto" and isinstance(backend, _RepeatBackend):
-        print(
-            "Input backend fell back to legacy repeat mode. "
-            "For real key up/down (no repeat), install one of: \n"
-            "  - pynput: pip install pynput  (often best on Windows)\n"
-            "  - keyboard: pip install keyboard  (often best on Raspberry Pi; may require sudo)\n"
-            "Or run with: --input pynput / --input keyboard"
-        )
 
     speed_setting = 1.0 if full_speed else DEFAULT_SPEED
     last_printed = None
@@ -1019,12 +757,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="disable PWM/speed control (useful if EN jumpers are left on); turning cuts one side",
     )
-    parser.add_argument(
-        "--input",
-        default="auto",
-        choices=("auto", "pynput", "keyboard", "repeat"),
-        help="keyboard input backend: auto (default), pynput (key up/down), keyboard (module), repeat (legacy)",
-    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     print(f"motor_test.py version: {SCRIPT_VERSION}")
@@ -1066,7 +798,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.test:
             return run_test(motors)
-        return run_teleop(motors, input_mode=args.input, full_speed=args.full_speed)
+        return run_teleop(motors, full_speed=args.full_speed)
     finally:
         try:
             cleanup()
