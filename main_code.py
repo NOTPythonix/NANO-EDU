@@ -119,9 +119,7 @@ def _apply_command(state: RuntimeState, cmd: Tuple[str, Optional[int]]) -> None:
         return
 
     if name == "autonomous_on":
-        state.autonomous = True
-        state.manual_throttle = 0.0
-        state.manual_steer = 0.0
+        state.autonomous = False
         return
 
     if name == "autonomous_off":
@@ -201,9 +199,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         print("IR: unavailable (python-lirc not installed)")
 
-    cam = CameraController(CameraConfig(camera_index=0))
+    cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55))
     if cam.available:
-        print("Camera: enabled")
+        print("Camera: capture available (streaming design)")
     else:
         print("Camera: unavailable (OpenCV not installed or no camera)")
 
@@ -221,14 +219,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     break
                 kind, k = ev
                 if kind == "down" and k == "o":
-                    if cam.available:
-                        state.autonomous = not state.autonomous
-                        if state.autonomous:
-                            state.manual_throttle = 0.0
-                            state.manual_steer = 0.0
-                        print(f"Autonomous: {'ON' if state.autonomous else 'OFF'}")
-                    else:
-                        print("Autonomous requested, but camera is unavailable")
+                    print("Autonomous is server-driven in the new design (use the server TUI)")
+                    state.autonomous = False
                 elif kind == "down" and k == "[":
                     state.speed_setting = max(0.0, state.speed_setting - 0.05)
                 elif kind == "down" and k == "]":
@@ -267,27 +259,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pass
 
             if state.autonomous:
-                obs = cam.read_obstacle()
-                if obs is None:
-                    target_left = 0.0
-                    target_right = 0.0
-                else:
-                    # Legacy behavior: clear -> forward; left obstacle -> turn right; right obstacle -> turn left.
-                    if obs == "clear":
-                        throttle, steer = 1.0, 0.0
-                    elif obs == "left":
-                        throttle, steer = 0.0, 1.0
-                    elif obs == "right":
-                        throttle, steer = 0.0, -1.0
-                    else:
-                        throttle, steer = 0.0, -1.0
-                    target_left, target_right = mix_throttle_steer(
-                        throttle,
-                        steer,
-                        speed_setting=state.speed_setting,
-                        cfg=cfg,
-                        full_speed=bool(args.full_speed),
-                    )
+                target_left = 0.0
+                target_right = 0.0
             else:
                 # Keyboard manual (car-game feel)
                 throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)

@@ -1,44 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
-
-ObstacleState = Literal["clear", "left", "right", "center"]
+from typing import Optional
 
 
 @dataclass
 class CameraConfig:
+    """Camera capture settings for streaming to the server."""
+
     camera_index: int = 0
-
-
-def detect_obstacle(frame) -> ObstacleState:
-    """Detect obstacle location in a frame.
-
-    This matches the heuristic used in the legacy monolithic script.
-    """
-
-    import cv2  # type: ignore
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (15, 15), 0)
-    _, thresh = cv2.threshold(blur, 120, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return "clear"
-    largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
-    if area < 6000:
-        return "clear"
-    x, y, w, h = cv2.boundingRect(largest)
-    center_x = x + w // 2
-    if center_x < 150:
-        return "left"
-    if center_x > 350:
-        return "right"
-    return "center"
+    width: int = 320
+    height: int = 240
+    jpeg_quality: int = 55
 
 
 class CameraController:
+    """Captures frames and encodes them as JPEG bytes.
+
+    This replaces the legacy on-device obstacle heuristic. The intended design is:
+    - client (Pi) captures frames
+    - server performs inference
+    - server sends back driving commands / annotations
+    """
+
     def __init__(self, cfg: CameraConfig):
         self._cfg = cfg
         self._cv2 = None
@@ -48,7 +32,14 @@ class CameraController:
             import cv2  # type: ignore
 
             self._cv2 = cv2
-            self._cap = cv2.VideoCapture(cfg.camera_index)
+            cap = cv2.VideoCapture(cfg.camera_index)
+            # Best-effort; some backends ignore this.
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(cfg.width))
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(cfg.height))
+            except Exception:
+                pass
+            self._cap = cap
         except Exception:
             self._cv2 = None
             self._cap = None
@@ -57,14 +48,28 @@ class CameraController:
     def available(self) -> bool:
         return bool(self._cap is not None)
 
-    def read_obstacle(self) -> Optional[ObstacleState]:
-        if not self._cap:
+    def read_jpeg(self) -> Optional[bytes]:
+        """Return a single JPEG frame, or None if unavailable."""
+
+        if not self._cap or not self._cv2:
             return None
         ret, frame = self._cap.read()
         if not ret:
             return None
+
+        cv2 = self._cv2
         try:
-            return detect_obstacle(frame)
+            # Resize for bandwidth stability.
+            frame = cv2.resize(frame, (int(self._cfg.width), int(self._cfg.height)))
+        except Exception:
+            pass
+
+        q = max(10, min(95, int(self._cfg.jpeg_quality)))
+        ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+        if not ok:
+            return None
+        try:
+            return bytes(enc.tobytes())
         except Exception:
             return None
 

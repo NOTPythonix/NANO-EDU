@@ -56,4 +56,4 @@ fi
 
 # Tunnel all CLI options through to the Python script so flags like
 # --dry-run / --dry_run are forwarded unchanged.
-exec "$VENV_EXE" motor_test.py "$@"
+exec "$VENV_EXE" tui_client.py "$@"

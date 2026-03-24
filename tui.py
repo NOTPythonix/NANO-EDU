@@ -4,12 +4,16 @@ import sys
 import queue
 import threading
 import time
+import base64
+import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from camera_control import CameraConfig, CameraController
 from ir_control import IRConfig, IRController
 from movement import DriveConfig, Motor, SkidSteerDrive, build_motors, load_motor_pins, mix_throttle_steer
+from robot_net import JsonLineLink
+from ui_layout import allocate_round_robin_heights
 from voice_control import VoiceConfig, VoiceController
 
 
@@ -109,6 +113,13 @@ class FeatureFlags:
     voice: bool = False
     camera: bool = False
     ir: bool = False
+
+
+@dataclass
+class NetworkConfig:
+    enabled: bool = False
+    host: str = ""
+    port: int = 8765
 
 
 @dataclass
@@ -576,7 +587,14 @@ def _motor_table(motor_map: Dict[str, Motor]) -> Table:
     return t
 
 
-def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: Optional[int], peak: float) -> int:
+def run_live_dashboard_tui(
+    *,
+    dry_run: bool,
+    features: FeatureFlags,
+    mic_index: Optional[int],
+    peak: float,
+    net: Optional[NetworkConfig] = None,
+) -> int:
     console = Console()
     _header(console)
 
@@ -604,7 +622,23 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
         vc.start()
 
     irc = IRController(IRConfig()) if features.ir else None
-    cam = CameraController(CameraConfig(camera_index=0)) if features.camera else None
+    cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55)) if features.camera else None
+
+    link: Optional[JsonLineLink] = None
+    if net and net.enabled and net.host:
+        link = JsonLineLink(host=net.host, port=net.port, role="client", name="robot")
+        link.start()
+
+    last_remote_cmd_ts: Optional[float] = None
+    remote_state: dict[str, Any] = {}
+    last_raw_motors_ts: Optional[float] = None
+    raw_motors: dict[str, Any] = {}
+
+    last_telemetry_tx = 0.0
+    last_frame_tx = 0.0
+    frames_sent = 0
+
+    raw_prev = False
 
     start_t = time.time()
     last_t = time.time()
@@ -634,6 +668,8 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
     else:
         motors_ratio, right_ratio = 5, 5
 
+    right_panel_order = ["status", "voice", "camera", "ir"]
+
     # Layout:
     # - Left column: Motors (short) + Autonomous (fills)
     # - Right column: Status + Voice/Camera/IR
@@ -651,22 +687,11 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
     motors_panel_h = max(10, min(18, main_h // 2))
     motors_panel_h = min(motors_panel_h, max(8, main_h - 6))
 
-    # Right-side debug panels: size close to their content so they don't show
-    # a trailing blank line at the bottom.
-    right_debug_h = max(1, main_h - STATUS_SIZE)
-    desired_voice_h, desired_camera_h, desired_ir_h = 8, 7, 7
-    if right_debug_h >= (desired_voice_h + desired_camera_h + desired_ir_h):
-        voice_panel_h = desired_voice_h
-        camera_panel_h = desired_camera_h
-        ir_panel_h = desired_ir_h
-        # Give any leftover space to Voice (most likely to grow).
-        extra = right_debug_h - (voice_panel_h + camera_panel_h + ir_panel_h)
-        voice_panel_h += max(0, extra)
-    else:
-        # Fallback: split evenly on very small terminals.
-        voice_panel_h = max(6, right_debug_h // 3)
-        camera_panel_h = max(6, right_debug_h // 3)
-        ir_panel_h = max(6, right_debug_h - voice_panel_h - camera_panel_h)
+    right_heights = allocate_round_robin_heights(main_h, right_panel_order, min_panel_h=5)
+    status_panel_h = right_heights["status"]
+    voice_panel_h = right_heights["voice"]
+    camera_panel_h = right_heights["camera"]
+    ir_panel_h = right_heights["ir"]
 
     layout["left"].split_column(
         Layout(name="motors", size=motors_panel_h),
@@ -674,7 +699,7 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
     )
 
     layout["right"].split_column(
-        Layout(name="status", size=STATUS_SIZE),
+        Layout(name="status", size=status_panel_h),
         Layout(name="debug_right"),
     )
     layout["debug_right"].split_column(
@@ -691,8 +716,8 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
             return "—"
         return f"{int(time.time() - ts)}s"
 
-    focus_order = ["auto", "voice", "camera", "ir"]
-    focused = "auto"
+    focus_order = ["status", "auto", "voice", "camera", "ir"]
+    focused = "status"
     scroll: Dict[str, int] = {k: 0 for k in focus_order}
 
     def _focus_border(base: str, key: str) -> str:
@@ -710,9 +735,12 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
         main_h = max(1, term_h - TOP_SIZE - BOTTOM_SIZE)
 
         # Estimate per-panel height based on current layout.
+        # - Status is the fixed top-right panel.
         # - Autonomous lives under Motors in the left column.
         # - Voice/Camera/IR live under Status in the right column.
-        if key == "auto":
+        if key == "status":
+            panel_h = status_panel_h
+        elif key == "auto":
             panel_h = max(3, main_h - motors_panel_h)
         elif key in ("voice", "camera", "ir"):
             if key == "voice":
@@ -758,6 +786,7 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
     last_ir_code: Optional[str] = None
     last_ir_cmd: Optional[ConsoleCmd] = None
     last_ir_ts: Optional[float] = None
+    # Camera is now streaming to the server; obstacle inference is server-side.
     last_obs: Optional[str] = None
     last_obs_ts: Optional[float] = None
     last_targets: Tuple[float, float] = (0.0, 0.0)
@@ -774,22 +803,39 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
             out = 0.0
         out_pct = int(round(max(0.0, min(1.0, out)) * 100))
 
-        t = Table(box=box.SIMPLE, show_header=False)
-        t.add_column("k", style="bold", no_wrap=True)
-        t.add_column("v")
-        t.add_row("Run", "DRY" if dry_run else "REAL")
-        t.add_row(f"Speed % (Cap {cap_pct}%):", f"{out_pct}%")
-        t.add_row("Uptime", f"{runtime_s}s")
+        net_state = "[dim]OFF[/]"
+        round_trip = "—"
+        receive_age = "—"
+        peer = "—"
+        if link is not None:
+            st = link.stats
+            now = time.time()
+            net_state = "[green]CONNECTED[/]" if st.connected else "[red]DISCONNECTED[/]"
+            round_trip = f"{float(st.rtt_ms):.1f} ms" if st.rtt_ms is not None else "—"
+            receive_age = f"{int(now - st.last_rx_ts)}s" if st.last_rx_ts is not None else "—"
+            peer = _ellipsize(st.peer or (f"{net.host}:{net.port}" if net else "—"), 28)
 
-        return Panel(t, title="Status", border_style="bright_blue")
+        rows = [
+            ("Run", "DRY" if dry_run else "REAL"),
+            ("Network", net_state),
+            ("Round trip time", round_trip),
+            ("Receive age", receive_age),
+            ("Peer", peer),
+            (f"Speed % (Cap {cap_pct}%):", f"{out_pct}%"),
+            ("Uptime", f"{runtime_s}s"),
+        ]
+
+        return _scrollable_panel("status", "Status", "bright_blue", rows)
 
     def autonomous_panel() -> Panel:
         cam_ok = bool(cam and cam.available)
+        net_ok = bool(link and link.stats.connected)
         rows = [
             ("Mode", on_off(state.autonomous)),
+            ("Net", on_off(net_ok)),
             ("Camera", on_off(cam_ok)),
-            ("Last obstacle", last_obs or "—"),
-            ("Age", age_s(last_obs_ts)),
+            ("Last server obs", last_obs or "—"),
+            ("Obs age", age_s(last_obs_ts)),
             ("Decision src", last_mode),
             ("Manual input", f"thr={state.manual_throttle:+.1f} steer={state.manual_steer:+.1f}"),
             ("Targets", f"L={last_targets[0]:+.2f}  R={last_targets[1]:+.2f}"),
@@ -844,15 +890,13 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
         available = bool(cam and cam.available)
         on = bool(enabled and available)
 
-        obs = last_obs
-        obstacle_yes = obs in ("left", "right", "center")
-
+        now = time.time()
+        last_age = "—" if not last_frame_tx else f"{int(now - last_frame_tx)}s"
         rows = [
             ("Enabled", on_off(enabled)),
             ("Available", on_off(available)),
-            ("Obstacle", "[red]YES[/]" if obstacle_yes else "[green]NO[/]" if obs == "clear" else "—"),
-            ("Where", obs or "—"),
-            ("Age", age_s(last_obs_ts)),
+            ("Frames sent", str(frames_sent)),
+            ("Last frame", last_age),
         ]
         return _scrollable_panel("camera", "Camera", "green" if on else "red", rows)
 
@@ -874,9 +918,68 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
         message = str(msg)
         message_until = (time.time() + float(duration_s)) if duration_s and duration_s > 0 else 0.0
 
+    def recalc_layout_sizes() -> None:
+        nonlocal main_h, motors_panel_h, status_panel_h, voice_panel_h, camera_panel_h, ir_panel_h
+
+        try:
+            term_h_now = int(getattr(console, "size").height)
+        except Exception:
+            term_h_now = 40
+
+        main_h = max(1, term_h_now - TOP_SIZE - BOTTOM_SIZE)
+
+        motors_panel_h = max(10, min(18, main_h // 2))
+        motors_panel_h = min(motors_panel_h, max(8, main_h - 6))
+
+        right_heights = allocate_round_robin_heights(main_h, right_panel_order, min_panel_h=5)
+        status_panel_h = right_heights["status"]
+        voice_panel_h = right_heights["voice"]
+        camera_panel_h = right_heights["camera"]
+        ir_panel_h = right_heights["ir"]
+
+        layout["left"]["motors"].size = motors_panel_h
+        layout["right"]["status"].size = status_panel_h
+        layout["debug_right"]["voice"].size = voice_panel_h
+        layout["debug_right"]["camera"].size = camera_panel_h
+        layout["debug_right"]["ir"].size = ir_panel_h
+
     try:
         with Live(layout, console=console, refresh_per_second=20, screen=True):
             while True:
+                now = time.time()
+                recalc_layout_sizes()
+
+                # Network RX
+                if link is not None:
+                    while True:
+                        msg = link.poll()
+                        if msg is None:
+                            break
+                        mtype = msg.get("type")
+                        if mtype == "command":
+                            st = msg.get("state")
+                            if isinstance(st, dict):
+                                remote_state = st
+                                last_remote_cmd_ts = now
+                        elif mtype == "raw_motors":
+                            mm = msg.get("motors")
+                            if isinstance(mm, dict):
+                                raw_motors = mm
+                                last_raw_motors_ts = now
+                        elif mtype == "server_obs":
+                            obs = msg.get("obs")
+                            if isinstance(obs, str):
+                                last_obs = obs
+                                last_obs_ts = now
+
+                # Remote control is considered active if we're connected and have a recent command.
+                remote_active = bool(
+                    link
+                    and link.stats.connected
+                    and last_remote_cmd_ts is not None
+                    and (now - float(last_remote_cmd_ts)) <= 0.6
+                )
+
                 # Edge events
                 while True:
                     ev = keys.poll_event()
@@ -884,18 +987,28 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
                         break
                     kind, k = ev
                     if kind == "down" and k == "o":
-                        if cam and cam.available:
+                        if remote_active:
+                            set_message("Server is controlling; use server TUI")
+                            continue
+                        # In the new design, autonomous requires a server link.
+                        if link is None or not link.stats.connected:
+                            set_message("Autonomous requires server link")
+                        else:
                             state.autonomous = not state.autonomous
                             if state.autonomous:
                                 state.manual_throttle = 0.0
                                 state.manual_steer = 0.0
                             set_message(f"Autonomous: {'ON' if state.autonomous else 'OFF'}")
-                        else:
-                            set_message("Autonomous requested, but camera is unavailable")
                     elif kind == "down" and k == "[":
+                        if remote_active:
+                            set_message("Server is controlling; use server TUI")
+                            continue
                         state.max_speed_setting = max(0.0, state.max_speed_setting - 0.05)
                         state.speed_setting = min(state.speed_setting, state.max_speed_setting)
                     elif kind == "down" and k == "]":
+                        if remote_active:
+                            set_message("Server is controlling; use server TUI")
+                            continue
                         state.max_speed_setting = min(1.0, state.max_speed_setting + 0.05)
                         state.speed_setting = min(state.max_speed_setting, state.speed_setting + 0.05)
                     elif kind == "down" and k in ("left", "right"):
@@ -919,6 +1032,22 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
                     state.manual_steer = 0.0
                     state.autonomous = False
                     set_message("Emergency stop.")
+
+                if remote_active:
+                    try:
+                        state.max_speed_setting = max(0.0, min(1.0, float(remote_state.get("max_speed_setting", state.max_speed_setting))))
+                        state.speed_setting = max(0.0, min(state.max_speed_setting, float(remote_state.get("speed_setting", state.speed_setting))))
+                        state.autonomous = bool(remote_state.get("autonomous", state.autonomous))
+                        state.manual_throttle = max(-1.0, min(1.0, float(remote_state.get("manual_throttle", 0.0))))
+                        state.manual_steer = max(-1.0, min(1.0, float(remote_state.get("manual_steer", 0.0))))
+                        if bool(remote_state.get("emergency_stop", False)):
+                            drive.emergency_stop()
+                            state.autonomous = False
+                            state.manual_throttle = 0.0
+                            state.manual_steer = 0.0
+                            set_message("Remote emergency stop")
+                    except Exception:
+                        pass
 
                 # Voice
                 if vc:
@@ -952,64 +1081,170 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
                     except queue.Empty:
                         pass
 
-                # Targets
-                if state.autonomous and cam and cam.available:
-                    obs = cam.read_obstacle()
-                    last_obs = obs
-                    last_obs_ts = time.time()
-                    if obs is None:
-                        target_left = 0.0
-                        target_right = 0.0
-                        message = "Camera: no frame"
-                    else:
-                        if obs == "clear":
-                            throttle, steer = 1.0, 0.0
-                        elif obs == "left":
-                            throttle, steer = 0.0, 1.0
-                        elif obs == "right":
-                            throttle, steer = 0.0, -1.0
+                # Raw motor override (server-side motor test / diagnostics)
+                raw_active = bool(
+                    link
+                    and link.stats.connected
+                    and last_raw_motors_ts is not None
+                    and (now - float(last_raw_motors_ts)) <= 0.4
+                    and isinstance(raw_motors, dict)
+                )
+
+                if raw_active:
+                    if not raw_prev:
+                        # Reset drive state so we don't jump when raw mode ends.
+                        try:
+                            drive.emergency_stop()
+                        except Exception:
+                            pass
+                    for name, sp in raw_motors.items():
+                        if name in motor_map:
+                            try:
+                                motor_map[name].set(float(sp), coast_on_stop=cfg.coast_on_stop)
+                            except Exception:
+                                pass
+                    target_left, target_right = 0.0, 0.0
+                    last_mode = "raw"
+                else:
+                    if raw_prev:
+                        try:
+                            drive.emergency_stop()
+                        except Exception:
+                            pass
+                    # Targets
+                    if state.autonomous:
+                        if remote_active:
+                            # Autonomous decisions are expected to come from the server as throttle/steer.
+                            target_left, target_right = mix_throttle_steer(
+                                state.manual_throttle,
+                                state.manual_steer,
+                                speed_setting=state.speed_setting,
+                                cfg=cfg,
+                                full_speed=False,
+                            )
+                            last_mode = "server"
                         else:
-                            throttle, steer = 0.0, -1.0
+                            target_left, target_right = 0.0, 0.0
+                            last_mode = "autonomous"
+                            set_message("Autonomous: waiting for server")
+                    else:
+                        if not remote_active:
+                            throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
+                            steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
+
+                            if any(k in pressed for k in ("w", "a", "s", "d")):
+                                state.manual_throttle = max(-1.0, min(1.0, throttle))
+                                state.manual_steer = max(-1.0, min(1.0, steer))
+                            else:
+                                state.manual_throttle = 0.0
+                                state.manual_steer = 0.0
+                            last_mode = "manual"
+                        else:
+                            last_mode = "remote"
+
                         target_left, target_right = mix_throttle_steer(
-                            throttle,
-                            steer,
+                            state.manual_throttle,
+                            state.manual_steer,
                             speed_setting=state.speed_setting,
                             cfg=cfg,
                             full_speed=False,
                         )
-                        message = f"Camera: {obs}"
-                    last_mode = "autonomous"
-                else:
-                    throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
-                    steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
 
-                    if any(k in pressed for k in ("w", "a", "s", "d")):
-                        state.manual_throttle = max(-1.0, min(1.0, throttle))
-                        state.manual_steer = max(-1.0, min(1.0, steer))
-                    else:
-                        state.manual_throttle = 0.0
-                        state.manual_steer = 0.0
-
-                    target_left, target_right = mix_throttle_steer(
-                        state.manual_throttle,
-                        state.manual_steer,
-                        speed_setting=state.speed_setting,
-                        cfg=cfg,
-                        full_speed=False,
-                    )
-                    last_mode = "manual"
+                raw_prev = raw_active
 
                 last_targets = (float(target_left), float(target_right))
 
                 now = time.time()
                 dt = max(0.0, now - last_t)
                 last_t = now
-                drive.update(target_left=target_left, target_right=target_right, dt_s=dt)
+
+                if not raw_active:
+                    drive.update(target_left=target_left, target_right=target_right, dt_s=dt)
 
                 # Auto-reset transient messages.
                 if message_until and now >= message_until:
                     message = "Ready."
                     message_until = 0.0
+
+                # Camera streaming (optional)
+                if link is not None and link.stats.connected and cam and cam.available and features.camera:
+                    if (now - last_frame_tx) >= 0.5:
+                        jpeg = cam.read_jpeg()
+                        if jpeg:
+                            try:
+                                b64 = base64.b64encode(jpeg).decode("ascii")
+                                link.send({"type": "frame", "ts": now, "jpeg_b64": b64})
+                                last_frame_tx = now
+                                frames_sent += 1
+                            except Exception:
+                                pass
+
+                # Telemetry TX (optional)
+                if link is not None and (now - last_telemetry_tx) >= 0.10:
+                    try:
+                        motors_tlm: dict[str, Any] = {}
+                        for n, m in motor_map.items():
+                            motors_tlm[n] = {"speed": float(m.last_speed), "invert": bool(m.pins.invert)}
+
+                        voice_info: dict[str, Any] = {
+                            "enabled": bool(features.voice),
+                            "available": bool(vc and vc.available),
+                        }
+                        if vc and hasattr(vc, "last_event"):
+                            try:
+                                last_text, last_cmd, last_ts = vc.last_event()  # type: ignore[attr-defined]
+                                voice_info.update(
+                                    {
+                                        "last_words": last_text or "—",
+                                        "parsed": (last_cmd[0] if last_cmd else "—"),
+                                        "applied": (last_voice_cmd[0] if last_voice_cmd else "—"),
+                                        "age": age_s(last_ts or last_voice_ts),
+                                    }
+                                )
+                            except Exception:
+                                pass
+
+                        ir_info: dict[str, Any] = {
+                            "enabled": bool(features.ir),
+                            "available": bool(irc and irc.available),
+                            "last_code": last_ir_code or "—",
+                            "applied": (last_ir_cmd[0] if last_ir_cmd else "—"),
+                            "age": age_s(last_ir_ts),
+                        }
+
+                        cam_info: dict[str, Any] = {
+                            "enabled": bool(features.camera),
+                            "available": bool(cam and cam.available),
+                            "frames_sent": int(frames_sent),
+                            "last_frame_age": ("—" if not last_frame_tx else f"{int(now - last_frame_tx)}s"),
+                        }
+
+                        link.send(
+                            {
+                                "type": "telemetry",
+                                "ts": now,
+                                "motors": motors_tlm,
+                                "state": {
+                                    "speed_setting": float(state.speed_setting),
+                                    "max_speed_setting": float(state.max_speed_setting),
+                                    "autonomous": bool(state.autonomous),
+                                    "manual_throttle": float(state.manual_throttle),
+                                    "manual_steer": float(state.manual_steer),
+                                },
+                                "last_cmd": {
+                                    "source": str(last_mode),
+                                    "manual": f"thr={state.manual_throttle:+.1f} steer={state.manual_steer:+.1f}",
+                                    "targets": f"L={last_targets[0]:+.2f}  R={last_targets[1]:+.2f}",
+                                },
+                                "message": str(message),
+                                "voice": voice_info,
+                                "camera": cam_info,
+                                "ir": ir_info,
+                            }
+                        )
+                        last_telemetry_tx = now
+                    except Exception:
+                        pass
 
                 # Render
                 layout["top"].update(top_panel())
@@ -1031,6 +1266,11 @@ def run_live_dashboard_tui(*, dry_run: bool, features: FeatureFlags, mic_index: 
         except Exception:
             pass
         _drain_stdin()
+        try:
+            if link is not None:
+                link.stop()
+        except Exception:
+            pass
         try:
             if vc:
                 vc.stop()
@@ -1121,6 +1361,30 @@ def main() -> int:
         ir="ir" in picked,
     )
 
+    # Optional network link (client can proceed even if disconnected)
+    _header(console)
+    console.print(Panel("Optional: connect to a server-side TUI for remote control/inference.", border_style="bright_blue"))
+    net_choice = _select_one(
+        console,
+        "Network Link",
+        [
+            ("off", "No network (local-only)"),
+            ("on", "Connect to server (optional on client)"),
+        ],
+    )
+
+    net_cfg: Optional[NetworkConfig] = None
+    if net_choice == "on":
+        default_host = os.environ.get("ROBOT_SERVER_HOST", "127.0.0.1")
+        default_port = int(os.environ.get("ROBOT_SERVER_PORT", "8765"))
+        host = default_host
+        try:
+            host = console.input(f"Server host [{default_host}]: ").strip() or default_host
+        except Exception:
+            host = default_host
+        port = IntPrompt.ask("Server port", default=default_port)
+        net_cfg = NetworkConfig(enabled=True, host=host, port=port)
+
     mic_index: Optional[int] = None
     if features.voice:
         ans = _select_one(
@@ -1138,8 +1402,13 @@ def main() -> int:
     console.print(Panel("Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
     time.sleep(0.6)
 
-    return run_live_dashboard_tui(dry_run=dry_run, features=features, mic_index=mic_index, peak=peak)
+    return run_live_dashboard_tui(dry_run=dry_run, features=features, mic_index=mic_index, peak=peak, net=net_cfg)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        "Do not run tui.py directly.\n\n"
+        "Run one of these instead:\n"
+        "  python tui_client.py\n"
+        "  python server/tui_server.py\n"
+    )
