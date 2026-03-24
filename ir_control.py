@@ -75,7 +75,7 @@ class IRController:
         if "power" in k:
             return ("stop", None)
         if "autonomous" in k or "mode" in k:
-            return ("autonomous_on", None)
+            return ("autonomous_toggle", None)
         if k.startswith("key_") and k[4:].isdigit():
             n = int(k[4:])
             val = max(0, min(100, int(n * 11)))

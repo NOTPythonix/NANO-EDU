@@ -126,6 +126,13 @@ def _apply_command(state: RuntimeState, cmd: Tuple[str, Optional[int]]) -> None:
         state.autonomous = False
         return
 
+    if name == "autonomous_toggle":
+        state.autonomous = not state.autonomous
+        if not state.autonomous:
+            state.manual_throttle = 0.0
+            state.manual_steer = 0.0
+        return
+
     if name == "speed" and isinstance(val, int):
         # Accept 0..100 from voice/IR.
         state.speed_setting = max(0.0, min(1.0, float(val) / 100.0))

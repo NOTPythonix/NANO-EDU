@@ -261,6 +261,16 @@ def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
 
     if name == "speed" and isinstance(val, int):
         state.speed_setting = max(0.0, min(state.max_speed_setting, float(val) / 100.0))
+    
+    if name == "autonomous_toggle":
+        state.autonomous = not state.autonomous
+        if state.autonomous:
+            state.manual_throttle = 0.0
+            state.manual_steer = 0.0
+        else:
+            state.manual_throttle = 0.0
+            state.manual_steer = 0.0
+        return
         return
 
 
