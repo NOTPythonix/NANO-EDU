@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
-import queue
-import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -14,6 +12,8 @@ if ROOT_DIR not in sys.path:
 
 from net_server import JsonLineRobotServer
 from inference import infer_from_jpeg_b64
+from rtsp_web import RtspWebUi
+from tui import ErrorMessageQueue, PynputKeys, _ellipsize, _motor_label, _select_one, build_info_grid, ui_on_off
 from ui_layout import allocate_round_robin_heights
 
 
@@ -47,6 +47,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import IntPrompt
 from rich.table import Table
+from rich.text import Text
 
 
 @dataclass
@@ -59,164 +60,9 @@ class ServerCmdState:
     emergency_stop: bool = False
 
 
-class PynputKeys:
-    def __init__(self):
-        try:
-            from pynput import keyboard as pynput_keyboard  # type: ignore
-        except Exception as e:
-            raise RuntimeError("pynput is required. Install with: pip install pynput") from e
-
-        self._kb = pynput_keyboard
-        self._pressed: Set[str] = set()
-        self._lock = threading.Lock()
-        self._listener = None
-        self._events: "queue.Queue[Tuple[str, str]]" = queue.Queue()
-
-    def start(self) -> None:
-        kb = self._kb
-
-        def norm(key) -> Optional[str]:
-            try:
-                if hasattr(key, "char") and key.char:
-                    return str(key.char).lower()
-            except Exception:
-                pass
-            if key == kb.Key.up:
-                return "up"
-            if key == kb.Key.down:
-                return "down"
-            if key == kb.Key.left:
-                return "left"
-            if key == kb.Key.right:
-                return "right"
-            if key == kb.Key.enter:
-                return "enter"
-            if key == kb.Key.esc:
-                return "esc"
-            if key == kb.Key.space:
-                return "space"
-            return None
-
-        def on_press(key) -> None:
-            k = norm(key)
-            if k is None:
-                return
-            with self._lock:
-                was_down = k in self._pressed
-                self._pressed.add(k)
-            if not was_down:
-                self._events.put(("down", k))
-
-        def on_release(key) -> None:
-            k = norm(key)
-            if k is None:
-                return
-            with self._lock:
-                self._pressed.discard(k)
-            self._events.put(("up", k))
-
-        listener_kwargs: Dict[str, Any] = {"on_press": on_press, "on_release": on_release}
-        if sys.platform.startswith("linux"):
-            # On Linux terminals, arrow keys can also be interpreted by the TTY,
-            # causing viewport jitter while the TUI is running.
-            listener_kwargs["suppress"] = True
-
-        try:
-            self._listener = kb.Listener(**listener_kwargs)
-        except TypeError:
-            listener_kwargs.pop("suppress", None)
-            self._listener = kb.Listener(**listener_kwargs)
-        self._listener.start()
-
-    def stop(self) -> None:
-        if self._listener is not None:
-            try:
-                self._listener.stop()
-            except Exception:
-                pass
-
-    def snapshot(self) -> Set[str]:
-        with self._lock:
-            return set(self._pressed)
-
-    def poll_event(self) -> Optional[Tuple[str, str]]:
-        try:
-            return self._events.get_nowait()
-        except queue.Empty:
-            return None
-
-
-def _ellipsize(s: str, max_len: int) -> str:
-    s = str(s)
-    if max_len <= 0:
-        return ""
-    if len(s) <= max_len:
-        return s
-    if max_len <= 3:
-        return s[:max_len]
-    return s[: max_len - 3] + "..."
-
-
 def _header(console: Console) -> None:
     console.clear()
     console.print(Align.center("[bold bright_cyan]HSEF Robot Control[/]  [dim]SERVER TUI[/]"))
-
-
-def _motor_label(short: str) -> str:
-    return {
-        "lf": "Left Front",
-        "lr": "Left Rear",
-        "rf": "Right Front",
-        "rr": "Right Rear",
-    }.get(short, short)
-
-
-def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> Panel:
-    t = Table(box=box.SIMPLE, show_header=False, expand=True)
-    t.add_column("sel", width=2)
-    t.add_column("Option", style="bold")
-    t.add_column("Description", style="dim")
-
-    for i, (key, desc) in enumerate(options):
-        is_sel = i == selected
-        marker = "➤" if is_sel else " "
-        opt_style = "reverse bold" if is_sel else ""
-        t.add_row(marker, f"[{opt_style}]{key}[/]" if opt_style else key, desc)
-
-    help_line = "[dim]↑/↓ to move, Enter to select, Q/Esc to quit[/]"
-    return Panel(t, title=title, border_style="bright_blue", subtitle=help_line)
-
-
-def _select_one(console: Console, title: str, options: list[tuple[str, str]]) -> str:
-    keys = PynputKeys()
-    keys.start()
-
-    selected = 0
-    try:
-        console.clear()
-        with Live(_render_menu(title, options, selected), console=console, refresh_per_second=30, screen=True) as live:
-            while True:
-                ev = keys.poll_event()
-                if ev is None:
-                    time.sleep(0.01)
-                    continue
-                kind, k = ev
-                if kind != "down":
-                    continue
-                if k in ("q", "esc"):
-                    raise SystemExit(130)
-                if k == "up":
-                    selected = (selected - 1) % len(options)
-                elif k == "down":
-                    selected = (selected + 1) % len(options)
-                elif k == "enter":
-                    return options[selected][0]
-                live.update(_render_menu(title, options, selected))
-    finally:
-        try:
-            keys.stop()
-        except Exception:
-            pass
 
 
 def _motor_table_from_telemetry(tlm: dict[str, Any]) -> Table:
@@ -271,10 +117,6 @@ def _age_s(now: float, ts: Optional[float]) -> str:
     return f"{int(max(0.0, now - ts))}s"
 
 
-def _on_off(v: bool) -> str:
-    return "[green]ON[/]" if v else "[red]OFF[/]"
-
-
 def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
     keys = PynputKeys()
     keys.start()
@@ -307,7 +149,7 @@ def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
             pass
 
 
-def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
+def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optional[RtspWebUi] = None) -> int:
     keys = PynputKeys()
     keys.start()
 
@@ -330,6 +172,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
 
     message = "Ready."
     message_until = 0.0
+    error_messages = ErrorMessageQueue(display_s=3.0)
 
     try:
         term_h = int(getattr(console, "size").height)
@@ -415,11 +258,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
         more_down = (off + window) < len(rows)
         view = rows[off : off + window]
 
-        grid = Table.grid(expand=True, pad_edge=False)
-        grid.add_column(style="bold", no_wrap=True)
-        grid.add_column(no_wrap=True, overflow="ellipsis", ratio=1, justify="right")
-        for k, v in view:
-            grid.add_row(str(k), str(v))
+        grid = build_info_grid(view)
 
         subtitle = ""
         if key == focused:
@@ -436,6 +275,18 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
             border_style="bright_cyan",
         )
 
+    def _rows_from_ui(tlm: dict[str, Any], key: str, fallback: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        ui = tlm.get("ui_rows") if isinstance(tlm, dict) else None
+        sec = ui.get(key) if isinstance(ui, dict) else None
+        if isinstance(sec, list):
+            out: list[tuple[str, str]] = []
+            for item in sec:
+                if isinstance(item, dict):
+                    out.append((str(item.get("k", "—")), str(item.get("v", "—"))))
+            if out:
+                return out
+        return fallback
+
     def status_panel(now: float, tlm: dict[str, Any]) -> Panel:
         runtime_s = int(now - start_t)
 
@@ -449,6 +300,8 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
             out_pct = 0
 
         cap_pct = int(round(cmd.max_speed_setting * 100))
+        net_info = tlm.get("network") or {}
+        client_ip = str(net_info.get("client_ip", "—")) if isinstance(net_info, dict) else "—"
 
         net = "[green]CONNECTED[/]" if srv.stats.connected else "[red]DISCONNECTED[/]"
         round_trip = f"{float(srv.stats.rtt_ms):.1f} ms" if srv.stats.rtt_ms is not None else "—"
@@ -456,38 +309,42 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
 
         rows = [
             ("Network", net),
+            ("Client IP", client_ip),
             ("Round trip time", round_trip),
             ("Receive age", receive_age),
             (f"Speed % (Cap {cap_pct}%):", f"{out_pct}%"),
             ("Uptime", f"{runtime_s}s"),
         ]
+        rows = _rows_from_ui(tlm, "status", rows)
         return _scrollable_panel("status", "Status", "bright_blue", rows)
 
     def auto_panel(now: float, tlm: dict[str, Any]) -> Panel:
         st = tlm.get("state") or {}
         last_cmd = tlm.get("last_cmd") or {}
         rows = [
-            ("Mode", _on_off(bool(st.get("autonomous", False)))),
+            ("Mode", ui_on_off(bool(st.get("autonomous", False)))),
             ("Decision src", str(last_cmd.get("source", "—"))),
             ("Manual input", str(last_cmd.get("manual", "—"))),
             ("Targets", str(last_cmd.get("targets", "—"))),
             ("Msg", str(tlm.get("message", "—"))),
         ]
+        rows = _rows_from_ui(tlm, "autonomous", [(k, str(v)) for k, v in rows])
         base = "green" if bool(st.get("autonomous", False)) else "red"
-        return _scrollable_panel("auto", "Autonomous", base, [(k, str(v)) for k, v in rows])
+        return _scrollable_panel("auto", "Autonomous", base, rows)
 
     def voice_panel(tlm: dict[str, Any]) -> Panel:
         v = tlm.get("voice") or {}
         rows = [
-            ("Enabled", _on_off(bool(v.get("enabled", False)))),
-            ("Available", _on_off(bool(v.get("available", False)))),
+            ("Enabled", ui_on_off(bool(v.get("enabled", False)))),
+            ("Available", ui_on_off(bool(v.get("available", False)))),
             ("Last words", str(v.get("last_words", "—"))),
             ("Parsed cmd", str(v.get("parsed", "—"))),
             ("Applied cmd", str(v.get("applied", "—"))),
             ("Age", str(v.get("age", "—"))),
         ]
+        rows = _rows_from_ui(tlm, "voice", [(k, str(vv)) for k, vv in rows])
         on = bool(v.get("enabled", False)) and bool(v.get("available", False))
-        return _scrollable_panel("voice", "Voice", "green" if on else "red", [(k, str(vv)) for k, vv in rows])
+        return _scrollable_panel("voice", "Voice", "green" if on else "red", rows)
 
     def camera_panel(now: float, tlm: dict[str, Any]) -> Panel:
         c = tlm.get("camera") or {}
@@ -495,24 +352,30 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
         available = bool(c.get("available", False))
         on = enabled and available
         rows = [
-            ("Enabled", _on_off(enabled)),
-            ("Available", _on_off(available)),
+            ("Enabled", ui_on_off(enabled)),
+            ("Available", ui_on_off(available)),
+            ("Camera err", str(c.get("camera_error", "—"))),
+            ("Stream", str(c.get("rtsp_status", "—"))),
+            ("Stream URL", str(c.get("rtsp_url", "—"))),
+            ("Stream err", str(c.get("rtsp_error", "—"))),
             ("Frames sent", str(c.get("frames_sent", "—"))),
             ("Last frame", str(c.get("last_frame_age", "—"))),
         ]
-        return _scrollable_panel("camera", "Camera", "green" if on else "red", [(k, str(v)) for k, v in rows])
+        rows = _rows_from_ui(tlm, "camera", [(k, str(v)) for k, v in rows])
+        return _scrollable_panel("camera", "Camera", "green" if on else "red", rows)
 
     def ir_panel(tlm: dict[str, Any]) -> Panel:
         i = tlm.get("ir") or {}
         rows = [
-            ("Enabled", _on_off(bool(i.get("enabled", False)))),
-            ("Available", _on_off(bool(i.get("available", False)))),
+            ("Enabled", ui_on_off(bool(i.get("enabled", False)))),
+            ("Available", ui_on_off(bool(i.get("available", False)))),
             ("Last code", str(i.get("last_code", "—"))),
             ("Applied cmd", str(i.get("applied", "—"))),
             ("Age", str(i.get("age", "—"))),
         ]
+        rows = _rows_from_ui(tlm, "ir", [(k, str(v)) for k, v in rows])
         on = bool(i.get("enabled", False)) and bool(i.get("available", False))
-        return _scrollable_panel("ir", "IR", "green" if on else "red", [(k, str(v)) for k, v in rows])
+        return _scrollable_panel("ir", "IR", "green" if on else "dim", rows)
 
     seq = 0
     last_obs: Optional[str] = None
@@ -576,7 +439,15 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
                         res = infer_from_jpeg_b64(jpeg_b64)
                         cmd.manual_throttle = max(-1.0, min(1.0, float(res.throttle)))
                         cmd.manual_steer = max(-1.0, min(1.0, float(res.steer)))
-                        last_obs = str(res.obstacle)
+                        if str(res.obstacle) == "clear":
+                            last_obs = "clear"
+                        else:
+                            label = str(getattr(res, "label", "—") or "—")
+                            conf = float(getattr(res, "confidence", 0.0) or 0.0)
+                            if label and label not in ("—", "none"):
+                                last_obs = f"{res.obstacle} ({label} {conf:.2f})"
+                            else:
+                                last_obs = str(res.obstacle)
                         last_obs_ts = now
                     else:
                         cmd.manual_throttle = 0.0
@@ -607,9 +478,30 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
 
                 tlm = srv.session.latest_telemetry or {}
 
-                if message_until and now >= message_until:
-                    message_until = 0.0
-                    message = "Ready."
+                srv_net_err = str(srv.stats.last_error or "") if not srv.stats.connected else ""
+                srv_web_err = str(web_ui.last_error or "") if web_ui else ""
+
+                net_info = tlm.get("network") or {}
+                cam_info = tlm.get("camera") or {}
+                voice_info = tlm.get("voice") or {}
+                ir_info = tlm.get("ir") or {}
+
+                cli_net_err = str(net_info.get("error", "") if isinstance(net_info, dict) else "")
+                cli_cam_err = str(cam_info.get("camera_error", "") if isinstance(cam_info, dict) else "")
+                cli_rtsp_err = str(cam_info.get("rtsp_error", "") if isinstance(cam_info, dict) else "")
+                cli_voice_err = str(voice_info.get("error", "") if isinstance(voice_info, dict) else "")
+                cli_ir_err = str(ir_info.get("error", "") if isinstance(ir_info, dict) else "")
+
+                # Server-side errors first, then client-side relayed errors.
+                error_messages.feed("server.network", srv_net_err, now_s=now, prefix="[s]", priority=2, label="Network")
+                error_messages.feed("server.web", srv_web_err, now_s=now, prefix="[s]", priority=2, label="Web UI")
+                error_messages.feed("client.network", cli_net_err, now_s=now, prefix="[c]", priority=1, label="Network")
+                error_messages.feed("client.camera", cli_cam_err, now_s=now, prefix="[c]", priority=1, label="Camera")
+                error_messages.feed("client.stream", cli_rtsp_err, now_s=now, prefix="[c]", priority=1, label="Stream")
+                error_messages.feed("client.voice", cli_voice_err, now_s=now, prefix="[c]", priority=1, label="Voice")
+                error_messages.feed("client.ir", cli_ir_err, now_s=now, prefix="[c]", priority=1, label="IR")
+
+                message, message_until = error_messages.next_message(now_s=now, current=message, current_until=message_until, ready="Ready.")
 
                 layout["top"].update(top_panel())
                 layout["motors"].update(Panel(_motor_table_from_telemetry(tlm), title="Motors", border_style="bright_green"))
@@ -618,7 +510,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer) -> int:
                 layout["voice"].update(voice_panel(tlm))
                 layout["camera"].update(camera_panel(now, tlm))
                 layout["ir"].update(ir_panel(tlm))
-                layout["bottom"].update(Panel(message, border_style="dim"))
+                layout["bottom"].update(Panel(Text(str(message)), border_style="dim"))
 
                 time.sleep(0.02)
 
@@ -813,37 +705,96 @@ def main() -> int:
     # Hard gate: do not proceed until the robot connects.
     wait_for_robot(console, srv)
 
-    _header(console)
-    action = _select_one(
-        console,
-        "Operation",
-        [
-            ("live", "Drive the robot with a live dashboard"),
-            ("test", "Run motor test with progress bars (remote)"),
-        ],
-    )
+    web_host = os.environ.get("ROBOT_WEB_HOST", bind_host)
+    web_port = int(os.environ.get("ROBOT_WEB_PORT", "8088"))
 
-    if action == "test":
-        console.print(Panel("Set session peak power for motor test.", border_style="bright_blue"))
-        peak_pct = IntPrompt.ask("Peak power %", default=65)
-        peak = max(0.0, min(1.0, float(peak_pct) / 100.0))
-        cycles_choice = _select_one(
+    def _current_rtsp_url() -> str:
+        tlm = srv.session.latest_telemetry or {}
+        if not isinstance(tlm, dict):
+            return ""
+
+        net_info = tlm.get("network")
+        if isinstance(net_info, dict):
+            url = str(net_info.get("rtsp_url", "")).strip()
+            low = url.lower()
+            if url and low not in ("—", "-", "none", "off", "null") and (low.startswith("rtsp://") or low.startswith("http://") or low.startswith("https://")):
+                return url
+
+        cam_info = tlm.get("camera")
+        if isinstance(cam_info, dict):
+            url = str(cam_info.get("rtsp_url", "")).strip()
+            low = url.lower()
+            if url and low not in ("—", "-", "none", "off", "null") and (low.startswith("rtsp://") or low.startswith("http://") or low.startswith("https://")):
+                return url
+
+        return ""
+
+    web_ui = RtspWebUi(host=web_host, port=web_port, get_rtsp_url=_current_rtsp_url)
+    try:
+        web_ui.start()
+    except Exception as e:
+        _header(console)
+        console.print(Panel(f"Failed to start web UI: {e}", border_style="red"))
+        return 3
+
+    display_host = web_host
+    if display_host in ("0.0.0.0", "::", ""):
+        display_host = "127.0.0.1"
+    web_url = f"http://{display_host}:{web_port}/"
+
+    # Give operator a short window to open the viewer before choosing operation.
+    # Keep this static so terminal link detection (ctrl+click) remains stable.
+    rtsp_now = _current_rtsp_url() or "waiting for client stream URL..."
+    _header(console)
+    console.print(
+        Panel(
+            "Ctrl+Click to open camera web UI before selecting mode.\n"
+            f"[underline bright_cyan]{web_url}[/]\n"
+            f"Client Stream: [dim]{rtsp_now}[/]\n"
+            "Continuing in 3 seconds...",
+            title="Camera Viewer",
+            border_style="bright_blue",
+        )
+    )
+    time.sleep(3.0)
+
+    try:
+        _header(console)
+        action = _select_one(
             console,
-            "Cycles Per Motor",
+            "Operation",
             [
-                ("1", "Forward+reverse once"),
-                ("2", "Forward+reverse twice"),
-                ("3", "Forward+reverse three times"),
-                ("4", "Forward+reverse four times"),
-                ("5", "Forward+reverse five times"),
+                ("live", "Drive the robot with a live dashboard"),
+                ("test", "Run motor test with progress bars (remote)"),
             ],
         )
-        return run_remote_motor_test(console, srv, peak=peak, cycles_per_motor=int(cycles_choice))
 
-    _header(console)
-    console.print(Panel("Robot connected. Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
-    time.sleep(0.6)
-    return run_dashboard(console, srv)
+        if action == "test":
+            console.print(Panel("Set session peak power for motor test.", border_style="bright_blue"))
+            peak_pct = IntPrompt.ask("Peak power %", default=65)
+            peak = max(0.0, min(1.0, float(peak_pct) / 100.0))
+            cycles_choice = _select_one(
+                console,
+                "Cycles Per Motor",
+                [
+                    ("1", "Forward+reverse once"),
+                    ("2", "Forward+reverse twice"),
+                    ("3", "Forward+reverse three times"),
+                    ("4", "Forward+reverse four times"),
+                    ("5", "Forward+reverse five times"),
+                ],
+            )
+            return run_remote_motor_test(console, srv, peak=peak, cycles_per_motor=int(cycles_choice))
+
+        _header(console)
+        console.print(Panel("Robot connected. Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
+        time.sleep(0.6)
+        return run_dashboard(console, srv, web_ui=web_ui)
+    finally:
+        try:
+            web_ui.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

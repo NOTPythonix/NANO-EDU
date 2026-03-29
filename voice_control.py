@@ -1,117 +1,220 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+import re
 from typing import Optional, Tuple
 
 Command = Tuple[str, Optional[int]]
 
 
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "vosk-model-small-en-us-0.15"
+
+
+def _tail_words(text: str, limit: int = 7) -> str:
+    parts = str(text).strip().split()
+    if len(parts) <= limit:
+        return " ".join(parts)
+    return " ".join(parts[-limit:])
+
+
 @dataclass
 class VoiceConfig:
     mic_device_index: int | None = None
+    model_path: str | None = None
+    sample_rate: int = 16000
+    blocksize: int = 4000
 
 
 class VoiceController:
-    """Optional voice controller using SpeechRecognition.
+    """Optional voice controller using Vosk partial streaming.
 
-    If SpeechRecognition (and its audio deps) aren't installed, this controller becomes a no-op.
+    If Vosk or sounddevice aren't installed, this controller becomes a no-op.
     """
 
     def __init__(self, command_queue: "queue.Queue[Command]", cfg: VoiceConfig):
         self._q = command_queue
         self._cfg = cfg
 
-        self._sr = None
+        self._sd = None
+        self._vosk = None
+        self._model = None
         self._recognizer = None
-        self._mic = None
-        self._stop_listening = None
+        self._stream = None
+        self._audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=32)
+        self._worker: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
         self._lock = threading.Lock()
         self._last_text: str | None = None
         self._last_cmd: Command | None = None
         self._last_ts: float | None = None
+        self._last_emitted_cmd: Command | None = None
+        self.last_error: str = ""
 
         try:
-            import speech_recognition as sr  # type: ignore
+            from vosk import KaldiRecognizer, Model  # type: ignore
+            import sounddevice as sd  # type: ignore
 
-            self._sr = sr
-            self._recognizer = sr.Recognizer()
-            self._mic = sr.Microphone(device_index=cfg.mic_device_index) if cfg.mic_device_index is not None else sr.Microphone()
-            with self._mic as source:
-                self._recognizer.adjust_for_ambient_noise(source, duration=1)
-        except Exception:
-            self._sr = None
+            self._sd = sd
+            self._vosk = (KaldiRecognizer, Model)
+
+            model_path = Path(cfg.model_path) if cfg.model_path else DEFAULT_MODEL_PATH
+            if not model_path.exists():
+                raise FileNotFoundError(f"model not found: {model_path}")
+
+            self._model = Model(str(model_path))
+            self._recognizer = KaldiRecognizer(self._model, float(cfg.sample_rate))
+            self._recognizer.SetWords(True)
+            self.last_error = ""
+        except Exception as e:
+            self._sd = None
+            self._vosk = None
+            self._model = None
             self._recognizer = None
-            self._mic = None
+            self.last_error = f"vosk init failed: {e}"
 
     @property
     def available(self) -> bool:
-        return bool(self._sr and self._recognizer and self._mic)
+        return bool(self._sd and self._vosk and self._model and self._recognizer)
 
     def start(self) -> None:
         if not self.available:
-            return
-        self._stop_listening = self._recognizer.listen_in_background(self._mic, self._callback, phrase_time_limit=4)
-
-    def stop(self) -> None:
-        if self._stop_listening:
-            try:
-                self._stop_listening(wait_for_stop=False)
-            except Exception:
-                pass
-            self._stop_listening = None
-
-    def _callback(self, recognizer, audio) -> None:
-        sr = self._sr
-        if sr is None:
+            if not self.last_error:
+                self.last_error = "voice unavailable"
             return
         try:
-            text = recognizer.recognize_google(audio)
-            text = str(text).lower().strip()
-            cmd = self.parse_command(text)
+            if self._stream is not None:
+                return
 
-            with self._lock:
-                self._last_text = text
-                self._last_cmd = cmd
-                self._last_ts = time.time()
+            self._stop_event.clear()
 
-            if cmd:
-                self._q.put(cmd)
-        except sr.UnknownValueError:
+            def callback(indata, frames, time_info, status) -> None:
+                if status:
+                    self.last_error = f"audio status: {status}"
+                try:
+                    self._audio_q.put_nowait(bytes(indata))
+                except queue.Full:
+                    pass
+
+            self._stream = self._sd.RawInputStream(
+                samplerate=float(self._cfg.sample_rate),
+                blocksize=int(self._cfg.blocksize),
+                device=self._cfg.mic_device_index,
+                dtype="int16",
+                channels=1,
+                callback=callback,
+            )
+            self._stream.start()
+
+            self._worker = threading.Thread(target=self._worker_loop, name="VoiceController", daemon=True)
+            self._worker.start()
+            self.last_error = ""
+        except Exception as e:
+            self._close_stream()
+            self.last_error = f"voice start failed: {e}"
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._audio_q.put_nowait(b"")
+        except queue.Full:
             pass
-        except sr.RequestError:
-            pass
-        except Exception:
-            pass
+        self._close_stream()
+        if self._worker is not None:
+            try:
+                self._worker.join(timeout=0.5)
+            except Exception:
+                pass
+            self._worker = None
+
+    def _close_stream(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                data = self._audio_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._stop_event.is_set() or not data:
+                continue
+
+            recognizer = self._recognizer
+            if recognizer is None:
+                continue
+
+            try:
+                recognizer.AcceptWaveform(data)
+                partial = json.loads(recognizer.PartialResult()).get("partial", "")
+                partial = str(partial).strip()
+                cmd = self.parse_command(partial) if partial else None
+                display_text = _tail_words(partial) if partial else None
+
+                with self._lock:
+                    self._last_text = display_text or self._last_text
+                    self._last_cmd = cmd or self._last_cmd
+                    self._last_ts = time.time()
+
+                if cmd and cmd != self._last_emitted_cmd:
+                    self._last_emitted_cmd = cmd
+                    self._q.put(cmd)
+                self.last_error = ""
+            except Exception as e:
+                self.last_error = f"voice callback failed: {e}"
 
     def last_event(self) -> tuple[str | None, Command | None, float | None]:
-        """Return (last_text, last_cmd, last_timestamp)."""
+        """Return (last_partial_text, last_cmd, last_timestamp)."""
 
         with self._lock:
-            return self._last_text, self._last_cmd, self._last_ts
+            return _tail_words(self._last_text or "") or None, self._last_cmd, self._last_ts
 
     @staticmethod
     def parse_command(text: str) -> Command | None:
-        t = text.lower().strip()
-        if any(kw in t for kw in ("forward", "go forward", "move forward")):
-            return ("forward", None)
-        if any(kw in t for kw in ("back", "backward", "go back", "move back")):
-            return ("backward", None)
-        if any(kw in t for kw in ("left", "turn left", "go left")):
-            return ("left", None)
-        if any(kw in t for kw in ("right", "turn right", "go right")):
-            return ("right", None)
-        if "stop" in t or "halt" in t:
-            return ("stop", None)
-        if "autonomous on" in t or "autonomy on" in t or "autonomous mode" in t:
-            return ("autonomous_on", None)
-        if "autonomous off" in t or "autonomy off" in t:
-            return ("autonomous_off", None)
-        if "speed" in t:
-            for w in t.split():
-                if w.isdigit():
-                    return ("speed", int(w))
-        return None
+        t = str(text).lower().strip()
+        if not t:
+            return None
+
+        candidates: list[tuple[int, Command]] = []
+
+        def add_last(cmd: Command, patterns: list[str]) -> None:
+            best = -1
+            for pattern in patterns:
+                for match in re.finditer(pattern, t):
+                    best = max(best, match.start())
+            if best >= 0:
+                candidates.append((best, cmd))
+
+        add_last(("forward", None), [r"\bmove forward\b", r"\bgo forward\b", r"\bturn forward\b", r"\bforward\b"])
+        add_last(("backward", None), [r"\bmove back\b", r"\bgo back\b", r"\bturn back\b", r"\bbackward\b", r"\bback\b"])
+        add_last(("left", None), [r"\bturn left\b", r"\bgo left\b", r"\bleft\b"])
+        add_last(("right", None), [r"\bturn right\b", r"\bgo right\b", r"\bright\b"])
+        add_last(("stop", None), [r"\bstop\b", r"\bhalt\b"])
+        add_last(("autonomous_on", None), [r"\bautonomous on\b", r"\bautonomy on\b", r"\bautonomous mode\b"])
+        add_last(("autonomous_off", None), [r"\bautonomous off\b", r"\bautonomy off\b"])
+
+        for match in re.finditer(r"\bspeed\s+(\d{1,3})\b", t):
+            try:
+                candidates.append((match.start(), ("speed", int(match.group(1)))))
+            except Exception:
+                pass
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        return candidates[-1][1]

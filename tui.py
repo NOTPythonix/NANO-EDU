@@ -6,13 +6,14 @@ import threading
 import time
 import base64
 import os
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
 from camera_control import CameraConfig, CameraController
-from ir_control import IRConfig, IRController
 from movement import DriveConfig, Motor, SkidSteerDrive, build_motors, load_motor_pins, mix_throttle_steer
 from robot_net import JsonLineLink
+from rtsp_stream import RtspStreamConfig, RtspStreamPublisher
 from ui_layout import allocate_round_robin_heights
 from voice_control import VoiceConfig, VoiceController
 
@@ -48,6 +49,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import IntPrompt
 from rich.table import Table
+from rich.text import Text
 
 
 ConsoleCmd = Tuple[str, Optional[int]]
@@ -71,6 +73,62 @@ def _ellipsize(s: str, max_len: int) -> str:
     if max_len <= 3:
         return s[:max_len]
     return s[: max_len - 3] + "..."
+
+
+def ui_on_off(v: bool) -> str:
+    return "[green]ON[/]" if bool(v) else "[red]OFF[/]"
+
+
+def ui_on_off_error(state: str) -> str:
+    s = str(state or "").strip().lower()
+    if s == "on":
+        return "[green]ON[/]"
+    if s == "error":
+        return "[red]ERROR[/]"
+    return "[red]OFF[/]"
+
+
+def build_info_grid(rows: list[tuple[str, str]]) -> Table:
+    """Shared two-column row renderer for client/server panels."""
+
+    # Keep a small explicit gap between columns so long error values don't
+    # visually merge into keys on narrower terminals.
+    grid = Table.grid(expand=True, pad_edge=False, padding=(0, 1))
+    grid.add_column(style="bold", no_wrap=True)
+    grid.add_column(no_wrap=True, overflow="ellipsis", ratio=1, justify="right")
+    for k, v in rows:
+        grid.add_row(str(k), str(v))
+    return grid
+
+
+def _detect_local_ip(preferred_peer: Optional[str] = None) -> str:
+    """Best-effort local IPv4 for status/telemetry display."""
+
+    targets: list[tuple[str, int]] = []
+    if preferred_peer:
+        try:
+            targets.append((str(preferred_peer), 1))
+        except Exception:
+            pass
+    targets.extend([
+        ("8.8.8.8", 80),
+        ("1.1.1.1", 80),
+    ])
+
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((host, int(port)))
+                ip = s.getsockname()[0]
+                if ip:
+                    return str(ip)
+            finally:
+                s.close()
+        except Exception:
+            continue
+
+    return "127.0.0.1"
 
 
 def _drain_stdin() -> None:
@@ -107,6 +165,59 @@ def _drain_stdin() -> None:
         pass
 
 
+class ErrorMessageQueue:
+    """Timed error queue with source de-duplication."""
+
+    def __init__(self, *, display_s: float = 3.0):
+        self._display_s = float(display_s)
+        self._seq = 0
+        self._pending: list[tuple[int, int, str]] = []
+        self._last_by_source: Dict[str, str] = {}
+
+    def feed(
+        self,
+        source: str,
+        err: Optional[str],
+        *,
+        now_s: float,
+        prefix: str,
+        priority: int,
+        label: Optional[str] = None,
+    ) -> None:
+        src = str(source)
+        txt = str(err or "").strip()
+
+        if not txt or txt == "—":
+            return
+
+        shown_label = str(label or src)
+        shown = f"{str(prefix)} {shown_label}: {txt}".strip()
+        p = int(priority)
+
+        prev = self._last_by_source.get(src, "")
+        if txt != prev:
+            self._pending.append((p, self._seq, shown))
+            self._seq += 1
+            self._last_by_source[src] = txt
+
+    def next_message(self, *, now_s: float, current: str, current_until: float, ready: str = "Ready.") -> tuple[str, float]:
+        if current_until and float(now_s) < float(current_until):
+            return current, current_until
+
+        if self._pending:
+            # Highest priority first; FIFO within same priority.
+            best_i = 0
+            best = self._pending[0]
+            for i, item in enumerate(self._pending[1:], start=1):
+                if item[0] > best[0] or (item[0] == best[0] and item[1] < best[1]):
+                    best_i = i
+                    best = item
+            self._pending.pop(best_i)
+            return best[2], float(now_s) + self._display_s
+
+        return str(ready), 0.0
+
+
 @dataclass
 class FeatureFlags:
     motor: bool = True
@@ -129,6 +240,9 @@ class RuntimeState:
     autonomous: bool = False
     manual_throttle: float = 0.0
     manual_steer: float = 0.0
+    voice_active: bool = False
+    voice_throttle: float = 0.0
+    voice_steer: float = 0.0
 
 
 class PynputKeys:
@@ -206,6 +320,11 @@ class PynputKeys:
                 self._listener.stop()
             except Exception:
                 pass
+            try:
+                self._listener.join(timeout=0.5)
+            except Exception:
+                pass
+            self._listener = None
 
     def snapshot(self) -> Set[str]:
         with self._lock:
@@ -223,28 +342,41 @@ def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
 
     if name == "forward":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 1.0
+        state.voice_steer = 0.0
         state.manual_throttle = 1.0
         state.manual_steer = 0.0
         return
 
     if name == "backward":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = -1.0
+        state.voice_steer = 0.0
         state.manual_throttle = -1.0
         state.manual_steer = 0.0
         return
 
     if name == "left":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = -1.0
         state.manual_steer = -1.0
         return
 
     if name == "right":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = 1.0
         state.manual_steer = 1.0
         return
 
     if name == "stop":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
         state.manual_throttle = 0.0
         state.manual_steer = 0.0
         return
@@ -253,6 +385,9 @@ def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
         state.autonomous = True
         state.manual_throttle = 0.0
         state.manual_steer = 0.0
+        state.voice_active = False
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
         return
 
     if name == "autonomous_off":
@@ -267,6 +402,9 @@ def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
         if state.autonomous:
             state.manual_throttle = 0.0
             state.manual_steer = 0.0
+            state.voice_active = False
+            state.voice_throttle = 0.0
+            state.voice_steer = 0.0
         else:
             state.manual_throttle = 0.0
             state.manual_steer = 0.0
@@ -356,7 +494,7 @@ def _render_checklist(title: str, options: list[tuple[str, str, str]], selected:
     for i, (key, label, desc) in enumerate(options):
         is_sel = i == selected
         marker = "➤" if is_sel else " "
-        box_txt = "[x]" if key in checked else "[ ]"
+        box_txt = Text("[x]" if key in checked else "[ ]")
         opt_style = "reverse bold" if is_sel else ""
         shown_label = f"[{opt_style}]{label}[/]" if opt_style else label
         t.add_row(marker, box_txt, shown_label, desc)
@@ -641,13 +779,44 @@ def run_live_dashboard_tui(
     if vc and vc.available:
         vc.start()
 
-    irc = IRController(IRConfig()) if features.ir else None
-    cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55)) if features.camera else None
+    irc = None
+    cam: Optional[CameraController] = None
 
     link: Optional[JsonLineLink] = None
     if net and net.enabled and net.host:
         link = JsonLineLink(host=net.host, port=net.port, role="client", name="robot")
         link.start()
+
+    client_ip = _detect_local_ip(net.host if net and net.host else None)
+
+    rtsp_pub: Optional[RtspStreamPublisher] = None
+    rtsp_public_url = "—"
+    cam_init_q: "queue.Queue[tuple[CameraController, Optional[RtspStreamPublisher], str]]" = queue.Queue(maxsize=1)
+    cam_init_started = False
+
+    def _start_camera_stack_async() -> None:
+        nonlocal cam_init_started
+        if cam_init_started or not features.camera:
+            return
+        cam_init_started = True
+
+        def _worker() -> None:
+            local_cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55))
+            local_rtsp: Optional[RtspStreamPublisher] = None
+            local_rtsp_url = "—"
+            if local_cam.available:
+                stream_port = int(os.environ.get("ROBOT_STREAM_PORT", os.environ.get("ROBOT_RTSP_PORT", "8091")))
+                local_rtsp = RtspStreamPublisher(RtspStreamConfig(host="0.0.0.0", mjpeg_port=stream_port))
+                if local_rtsp.start():
+                    local_rtsp_url = local_rtsp.endpoint_url(client_ip)
+            try:
+                cam_init_q.put_nowait((local_cam, local_rtsp, local_rtsp_url))
+            except queue.Full:
+                pass
+
+        threading.Thread(target=_worker, name="CameraInit", daemon=True).start()
+
+    _start_camera_stack_async()
 
     last_remote_cmd_ts: Optional[float] = None
     remote_state: dict[str, Any] = {}
@@ -656,7 +825,13 @@ def run_live_dashboard_tui(
 
     last_telemetry_tx = 0.0
     last_frame_tx = 0.0
+    last_stream_tx = 0.0
+    last_server_frame_tx = 0.0
     frames_sent = 0
+
+    # Keep local camera stream snappy while sending server inference frames at a lower rate.
+    stream_interval_s = max(0.01, float(os.environ.get("ROBOT_STREAM_INTERVAL_S", "0.02")))
+    server_frame_interval_s = max(0.05, float(os.environ.get("ROBOT_SERVER_FRAME_INTERVAL_S", "0.10")))
 
     raw_prev = False
 
@@ -729,7 +904,7 @@ def run_live_dashboard_tui(
     )
 
     def on_off(v: bool) -> str:
-        return "[green]ON[/]" if v else "[red]OFF[/]"
+        return ui_on_off(v)
 
     def age_s(ts: Optional[float]) -> str:
         if ts is None:
@@ -784,13 +959,7 @@ def run_live_dashboard_tui(
         more_down = (off + window) < len(rows)
         view = rows[off : off + window]
 
-        grid = Table.grid(expand=True, pad_edge=False)
-        grid.add_column(style="bold", no_wrap=True)
-        # Make the value column expand to the remaining width so it doesn't
-        # change size when scrolling shows different rows.
-        grid.add_column(no_wrap=True, overflow="ellipsis", ratio=1, justify="right")
-        for k, v in view:
-            grid.add_row(str(k), str(v))
+        grid = build_info_grid(view)
 
         if key == focused:
             up_ind = "↑" if more_up else " "
@@ -838,6 +1007,7 @@ def run_live_dashboard_tui(
         rows = [
             ("Run", "DRY" if dry_run else "REAL"),
             ("Network", net_state),
+            ("Client IP", client_ip),
             ("Round trip time", round_trip),
             ("Receive age", receive_age),
             ("Peer", peer),
@@ -868,6 +1038,7 @@ def run_live_dashboard_tui(
         enabled = bool(features.voice)
         available = bool(vc and vc.available)
         on = bool(enabled and available)
+        voice_err = str(getattr(vc, "last_error", "") or "") if vc else ""
 
         last_text: Optional[str] = None
         last_cmd: Optional[ConsoleCmd] = None
@@ -883,6 +1054,7 @@ def run_live_dashboard_tui(
         rows = [
             ("Enabled", on_off(enabled)),
             ("Available", on_off(available)),
+            ("Voice err", _ellipsize(voice_err or "—", 30)),
             ("Last words", last_text or "—"),
             ("Parsed cmd", parsed),
             ("Applied cmd", applied),
@@ -894,27 +1066,38 @@ def run_live_dashboard_tui(
         enabled = bool(features.ir)
         available = bool(irc and irc.available)
         on = bool(enabled and available)
+        ir_err = str(getattr(irc, "last_error", "") or "") if irc else ""
 
         applied = f"{last_ir_cmd[0]}" if last_ir_cmd else "—"
         rows = [
             ("Enabled", on_off(enabled)),
             ("Available", on_off(available)),
+            ("IR err", _ellipsize(ir_err or "—", 30)),
             ("Last code", last_ir_code or "—"),
             ("Applied cmd", applied),
             ("Age", age_s(last_ir_ts)),
         ]
-        return _scrollable_panel("ir", "IR", "green" if on else "red", rows)
+        return _scrollable_panel("ir", "IR", "green" if on else "dim", rows)
 
     def camera_panel() -> Panel:
         enabled = bool(features.camera)
         available = bool(cam and cam.available)
         on = bool(enabled and available)
+        cam_err = str(getattr(cam, "last_error", "") or "") if cam else ("initializing..." if enabled else "")
+        rtsp_err = str(rtsp_pub.last_error) if rtsp_pub else ""
+        has_stream = bool(rtsp_pub and rtsp_pub.available)
+        state_key = "on" if (has_stream and not rtsp_err) else ("error" if rtsp_err else "off")
+        rtsp_state = ui_on_off_error(state_key)
 
         now = time.time()
         last_age = "—" if not last_frame_tx else f"{int(now - last_frame_tx)}s"
         rows = [
             ("Enabled", on_off(enabled)),
             ("Available", on_off(available)),
+            ("Camera err", _ellipsize(cam_err or "—", 30)),
+            ("Stream", rtsp_state),
+            ("Stream URL", _ellipsize(rtsp_public_url, 30)),
+            ("Stream err", _ellipsize(rtsp_err or "—", 30)),
             ("Frames sent", str(frames_sent)),
             ("Last frame", last_age),
         ]
@@ -928,10 +1111,11 @@ def run_live_dashboard_tui(
         )
 
     def bottom_panel(msg: str) -> Panel:
-        return Panel(msg, border_style="dim")
+        return Panel(Text(str(msg)), border_style="dim")
 
     message = "Ready."
     message_until: float = 0.0
+    error_messages = ErrorMessageQueue(display_s=3.0)
 
     def set_message(msg: str, *, duration_s: float = 3.0) -> None:
         nonlocal message, message_until
@@ -968,6 +1152,12 @@ def run_live_dashboard_tui(
             while True:
                 now = time.time()
                 recalc_layout_sizes()
+
+                if features.camera and cam is None:
+                    try:
+                        cam, rtsp_pub, rtsp_public_url = cam_init_q.get_nowait()
+                    except queue.Empty:
+                        pass
 
                 # Network RX
                 if link is not None:
@@ -1069,38 +1259,6 @@ def run_live_dashboard_tui(
                     except Exception:
                         pass
 
-                # Voice
-                if vc:
-                    try:
-                        while True:
-                            cmd = voice_q.get_nowait()
-                            _apply_external_command(state, cmd)
-                            message = f"Voice: {cmd[0]}"
-                            last_voice_cmd = cmd
-                            last_voice_ts = time.time()
-                    except queue.Empty:
-                        pass
-
-                # IR
-                if irc and irc.available:
-                    for code in irc.poll_codes():
-                        cmd = irc.parse_code(code)
-                        if cmd:
-                            ir_q.put(cmd)
-                            last_ir_code = code
-                            last_ir_ts = time.time()
-
-                if irc:
-                    try:
-                        while True:
-                            cmd = ir_q.get_nowait()
-                            _apply_external_command(state, cmd)
-                            message = f"IR: {cmd[0]}"
-                            last_ir_cmd = cmd
-                            last_ir_ts = time.time()
-                    except queue.Empty:
-                        pass
-
                 # Raw motor override (server-side motor test / diagnostics)
                 raw_active = bool(
                     link
@@ -1131,7 +1289,62 @@ def run_live_dashboard_tui(
                             drive.emergency_stop()
                         except Exception:
                             pass
-                    # Targets
+
+                    # Base local state from keyboard unless the server is actively driving.
+                    if not remote_active:
+                        throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
+                        steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
+
+                        if any(k in pressed for k in ("w", "a", "s", "d")):
+                            state.manual_throttle = max(-1.0, min(1.0, throttle))
+                            state.manual_steer = max(-1.0, min(1.0, steer))
+                        else:
+                            if state.voice_active:
+                                state.manual_throttle = state.voice_throttle
+                                state.manual_steer = state.voice_steer
+                            else:
+                                state.manual_throttle = 0.0
+                                state.manual_steer = 0.0
+                        last_mode = "manual"
+                    else:
+                        last_mode = "remote"
+
+                    if remote_active and state.voice_active:
+                        state.manual_throttle = state.voice_throttle
+                        state.manual_steer = state.voice_steer
+
+                    # Voice and IR override the current local command state after remote sync.
+                    # This keeps manual voice control responsive even when the client is connected.
+                    if vc:
+                        try:
+                            while True:
+                                cmd = voice_q.get_nowait()
+                                _apply_external_command(state, cmd)
+                                message = f"Voice: {cmd[0]}"
+                                last_voice_cmd = cmd
+                                last_voice_ts = time.time()
+                        except queue.Empty:
+                            pass
+
+                    if irc and irc.available:
+                        for code in irc.poll_codes():
+                            cmd = irc.parse_code(code)
+                            if cmd:
+                                ir_q.put(cmd)
+                                last_ir_code = code
+                                last_ir_ts = time.time()
+
+                    if irc:
+                        try:
+                            while True:
+                                cmd = ir_q.get_nowait()
+                                _apply_external_command(state, cmd)
+                                message = f"IR: {cmd[0]}"
+                                last_ir_cmd = cmd
+                                last_ir_ts = time.time()
+                        except queue.Empty:
+                            pass
+
                     if state.autonomous:
                         if remote_active:
                             # Autonomous decisions are expected to come from the server as throttle/steer.
@@ -1148,20 +1361,6 @@ def run_live_dashboard_tui(
                             last_mode = "autonomous"
                             set_message("Autonomous: waiting for server")
                     else:
-                        if not remote_active:
-                            throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
-                            steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
-
-                            if any(k in pressed for k in ("w", "a", "s", "d")):
-                                state.manual_throttle = max(-1.0, min(1.0, throttle))
-                                state.manual_steer = max(-1.0, min(1.0, steer))
-                            else:
-                                state.manual_throttle = 0.0
-                                state.manual_steer = 0.0
-                            last_mode = "manual"
-                        else:
-                            last_mode = "remote"
-
                         target_left, target_right = mix_throttle_steer(
                             state.manual_throttle,
                             state.manual_steer,
@@ -1182,26 +1381,66 @@ def run_live_dashboard_tui(
                     drive.update(target_left=target_left, target_right=target_right, dt_s=dt)
 
                 # Auto-reset transient messages.
-                if message_until and now >= message_until:
-                    message = "Ready."
-                    message_until = 0.0
+                net_err = ""
+                if link and not link.stats.connected:
+                    net_err = str(link.stats.last_error or "")
+                error_messages.feed("client.network", net_err, now_s=now, prefix="[c]", priority=0, label="Network")
+                error_messages.feed("client.camera", (getattr(cam, "last_error", "") if cam else ""), now_s=now, prefix="[c]", priority=0, label="Camera")
+                rtsp_err_feed = str(rtsp_pub.last_error if rtsp_pub else "")
+                error_messages.feed("client.stream", rtsp_err_feed, now_s=now, prefix="[c]", priority=0, label="Stream")
+                error_messages.feed("client.voice", (getattr(vc, "last_error", "") if vc else ""), now_s=now, prefix="[c]", priority=0, label="Voice")
+                error_messages.feed("client.ir", (getattr(irc, "last_error", "") if irc else ""), now_s=now, prefix="[c]", priority=0, label="IR")
 
-                # Camera streaming (optional)
-                if link is not None and link.stats.connected and cam and cam.available and features.camera:
-                    if (now - last_frame_tx) >= 0.5:
+                message, message_until = error_messages.next_message(now_s=now, current=message, current_until=message_until, ready="Ready.")
+
+                # Camera streaming (optional): one capture fan-outs to local MJPEG and server frame feed.
+                if cam and cam.available and features.camera:
+                    send_stream = bool(rtsp_pub and rtsp_pub.available and (now - last_stream_tx) >= stream_interval_s)
+                    send_server = bool(link is not None and link.stats.connected and (now - last_server_frame_tx) >= server_frame_interval_s)
+
+                    if send_stream or send_server:
                         jpeg = cam.read_jpeg()
                         if jpeg:
-                            try:
-                                b64 = base64.b64encode(jpeg).decode("ascii")
-                                link.send({"type": "frame", "ts": now, "jpeg_b64": b64})
-                                last_frame_tx = now
-                                frames_sent += 1
-                            except Exception:
-                                pass
+                            if send_stream and rtsp_pub and rtsp_pub.available:
+                                rtsp_pub.push_jpeg(jpeg)
+                                last_stream_tx = now
+                            if send_server:
+                                try:
+                                    b64 = base64.b64encode(jpeg).decode("ascii")
+                                    link.send({"type": "frame", "ts": now, "jpeg_b64": b64})
+                                    last_server_frame_tx = now
+                                except Exception:
+                                    pass
+                            last_frame_tx = now
+                            frames_sent += 1
 
                 # Telemetry TX (optional)
                 if link is not None and (now - last_telemetry_tx) >= 0.10:
                     try:
+                        net_state = "[green]CONNECTED[/]" if link.stats.connected else "[red]DISCONNECTED[/]"
+                        round_trip = f"{float(link.stats.rtt_ms):.1f} ms" if link.stats.rtt_ms is not None else "—"
+                        receive_age = f"{int(now - link.stats.last_rx_ts)}s" if link.stats.last_rx_ts is not None else "—"
+                        peer = _ellipsize(link.stats.peer or (f"{net.host}:{net.port}" if net else "—"), 28)
+
+                        runtime_s = int(now - start_t)
+                        cap_pct = int(round(state.max_speed_setting * 100))
+                        try:
+                            out_now = max(abs(m.last_speed) for m in motor_map.values()) if motor_map else 0.0
+                        except Exception:
+                            out_now = 0.0
+                        out_pct = int(round(max(0.0, min(1.0, out_now)) * 100))
+
+                        cam_enabled = bool(features.camera)
+                        cam_available = bool(cam and cam.available)
+                        cam_err_now = str(getattr(cam, "last_error", "") or "") if cam else ("initializing..." if cam_enabled else "")
+                        rtsp_err_now = str(rtsp_pub.last_error or "") if rtsp_pub else ""
+                        has_stream_now = bool(rtsp_pub and rtsp_pub.available)
+                        rtsp_state_now = ui_on_off_error(
+                            "on"
+                            if (has_stream_now and not rtsp_err_now)
+                            else ("error" if rtsp_err_now else "off")
+                        )
+
                         motors_tlm: dict[str, Any] = {}
                         for n, m in motor_map.items():
                             motors_tlm[n] = {"speed": float(m.last_speed), "invert": bool(m.pins.invert)}
@@ -1209,6 +1448,7 @@ def run_live_dashboard_tui(
                         voice_info: dict[str, Any] = {
                             "enabled": bool(features.voice),
                             "available": bool(vc and vc.available),
+                            "error": (str(getattr(vc, "last_error", "") or "—") if vc else "—"),
                         }
                         if vc and hasattr(vc, "last_event"):
                             try:
@@ -1227,14 +1467,23 @@ def run_live_dashboard_tui(
                         ir_info: dict[str, Any] = {
                             "enabled": bool(features.ir),
                             "available": bool(irc and irc.available),
+                            "error": (str(getattr(irc, "last_error", "") or "—") if irc else "—"),
                             "last_code": last_ir_code or "—",
                             "applied": (last_ir_cmd[0] if last_ir_cmd else "—"),
                             "age": age_s(last_ir_ts),
                         }
 
                         cam_info: dict[str, Any] = {
-                            "enabled": bool(features.camera),
-                            "available": bool(cam and cam.available),
+                            "enabled": cam_enabled,
+                            "available": cam_available,
+                            "camera_error": (str(getattr(cam, "last_error", "") or "—") if cam else "—"),
+                            "rtsp_status": (
+                                "on"
+                                if (rtsp_pub and rtsp_pub.available and not rtsp_pub.last_error)
+                                else ("error" if (rtsp_pub and rtsp_pub.last_error) else "off")
+                            ),
+                            "rtsp_error": (str(rtsp_pub.last_error) if rtsp_pub and rtsp_pub.last_error else "—"),
+                            "rtsp_url": str(rtsp_public_url or "—"),
                             "frames_sent": int(frames_sent),
                             "last_frame_age": ("—" if not last_frame_tx else f"{int(now - last_frame_tx)}s"),
                         }
@@ -1243,6 +1492,61 @@ def run_live_dashboard_tui(
                             {
                                 "type": "telemetry",
                                 "ts": now,
+                                "network": {
+                                    "client_ip": str(client_ip or "—"),
+                                    "rtsp_url": str(rtsp_public_url or "—"),
+                                    "error": str(net_err or "—"),
+                                },
+                                "ui_rows": {
+                                    "status": [
+                                        {"k": "Run", "v": ("DRY" if dry_run else "REAL")},
+                                        {"k": "Network", "v": net_state},
+                                        {"k": "Client IP", "v": str(client_ip or "—")},
+                                        {"k": "Round trip time", "v": round_trip},
+                                        {"k": "Receive age", "v": receive_age},
+                                        {"k": "Peer", "v": peer},
+                                        {"k": f"Speed % (Cap {cap_pct}%):", "v": f"{out_pct}%"},
+                                        {"k": "Uptime", "v": f"{runtime_s}s"},
+                                    ],
+                                    "autonomous": [
+                                        {"k": "Mode", "v": ui_on_off(state.autonomous)},
+                                        {"k": "Net", "v": ui_on_off(bool(link and link.stats.connected))},
+                                        {"k": "Camera", "v": ui_on_off(bool(cam and cam.available))},
+                                        {"k": "Last server obs", "v": str(last_obs or "—")},
+                                        {"k": "Obs age", "v": age_s(last_obs_ts)},
+                                        {"k": "Decision src", "v": str(last_mode)},
+                                        {"k": "Manual input", "v": f"thr={state.manual_throttle:+.1f} steer={state.manual_steer:+.1f}"},
+                                        {"k": "Targets", "v": f"L={last_targets[0]:+.2f}  R={last_targets[1]:+.2f}"},
+                                        {"k": "Msg", "v": str(message)},
+                                    ],
+                                    "voice": [
+                                        {"k": "Enabled", "v": ui_on_off(bool(features.voice))},
+                                        {"k": "Available", "v": ui_on_off(bool(vc and vc.available))},
+                                        {"k": "Voice err", "v": _ellipsize(str(voice_info.get("error", "—")), 30)},
+                                        {"k": "Last words", "v": str(voice_info.get("last_words", "—"))},
+                                        {"k": "Parsed cmd", "v": str(voice_info.get("parsed", "—"))},
+                                        {"k": "Applied cmd", "v": str(voice_info.get("applied", "—"))},
+                                        {"k": "Age", "v": str(voice_info.get("age", "—"))},
+                                    ],
+                                    "camera": [
+                                        {"k": "Enabled", "v": ui_on_off(cam_enabled)},
+                                        {"k": "Available", "v": ui_on_off(cam_available)},
+                                        {"k": "Camera err", "v": _ellipsize(str(cam_err_now or "—"), 30)},
+                                        {"k": "Stream", "v": rtsp_state_now},
+                                        {"k": "Stream URL", "v": _ellipsize(str(rtsp_public_url or "—"), 30)},
+                                        {"k": "Stream err", "v": _ellipsize(str(rtsp_err_now or "—"), 30)},
+                                        {"k": "Frames sent", "v": str(frames_sent)},
+                                        {"k": "Last frame", "v": ("—" if not last_frame_tx else f"{int(now - last_frame_tx)}s")},
+                                    ],
+                                    "ir": [
+                                        {"k": "Enabled", "v": ui_on_off(bool(features.ir))},
+                                        {"k": "Available", "v": ui_on_off(bool(irc and irc.available))},
+                                        {"k": "IR err", "v": _ellipsize(str(ir_info.get("error", "—")), 30)},
+                                        {"k": "Last code", "v": str(last_ir_code or "—")},
+                                        {"k": "Applied cmd", "v": str(last_ir_cmd[0] if last_ir_cmd else "—")},
+                                        {"k": "Age", "v": age_s(last_ir_ts)},
+                                    ],
+                                },
                                 "motors": motors_tlm,
                                 "state": {
                                     "speed_setting": float(state.speed_setting),
@@ -1307,6 +1611,11 @@ def run_live_dashboard_tui(
         except Exception:
             pass
         try:
+            if rtsp_pub:
+                rtsp_pub.stop()
+        except Exception:
+            pass
+        try:
             stop_all()
         except Exception:
             pass
@@ -1317,112 +1626,12 @@ def run_live_dashboard_tui(
 
 
 def main() -> int:
-    console = Console()
-    _header(console)
-
-    # Configure peak up-front (before run/operation selection).
-    console.print(Panel("Set session peak power (applies to live and test modes).", border_style="bright_blue"))
-    peak_pct = IntPrompt.ask("Peak power %", default=65)
-    peak = max(0.0, min(1.0, float(peak_pct) / 100.0))
-
-    mode = _select_one(
-        console,
-        "Run Mode",
-        [
-            ("dry", "Run without GPIO (safe on Windows)") ,
-            ("real", "Run on Raspberry Pi GPIO") ,
-        ],
+    raise SystemExit(
+        "Do not run tui.py directly.\n\n"
+        "Run one of these instead:\n"
+        "  python tui_client.py\n"
+        "  python server/tui_server.py\n"
     )
-    dry_run = mode == "dry"
-
-    _header(console)
-    action = _select_one(
-        console,
-        "Operation",
-        [
-            ("live", "Drive the robot with a live dashboard") ,
-            ("test", "Run motor test with progress bars") ,
-        ],
-    )
-
-    if action == "test":
-        cycles_choice = _select_one(
-            console,
-            "Cycles Per Motor",
-            [
-                ("1", "Forward+reverse once"),
-                ("2", "Forward+reverse twice"),
-                ("3", "Forward+reverse three times"),
-                ("4", "Forward+reverse four times"),
-                ("5", "Forward+reverse five times"),
-            ],
-        )
-        return run_motor_test_tui(dry_run=dry_run, peak=peak, cycles_per_motor=int(cycles_choice))
-
-    # Live mode
-    _header(console)
-    console.print(Panel("Motor control is required. Choose optional features:", border_style="bright_blue"))
-
-    picked = _select_checklist(
-        console,
-        "Optional Features",
-        [
-            ("voice", "Voice", "Voice control (SpeechRecognition + PyAudio)"),
-            ("camera", "Camera", "Obstacle detection (OpenCV)"),
-            ("ir", "IR", "IR remote (LIRC)"),
-        ],
-        default_checked=set(),
-    )
-
-    features = FeatureFlags(
-        motor=True,
-        voice="voice" in picked,
-        camera="camera" in picked,
-        ir="ir" in picked,
-    )
-
-    # Optional network link (client can proceed even if disconnected)
-    _header(console)
-    console.print(Panel("Optional: connect to a server-side TUI for remote control/inference.", border_style="bright_blue"))
-    net_choice = _select_one(
-        console,
-        "Network Link",
-        [
-            ("off", "No network (local-only)"),
-            ("on", "Connect to server (optional on client)"),
-        ],
-    )
-
-    net_cfg: Optional[NetworkConfig] = None
-    if net_choice == "on":
-        default_host = os.environ.get("ROBOT_SERVER_HOST", "127.0.0.1")
-        default_port = int(os.environ.get("ROBOT_SERVER_PORT", "8765"))
-        host = default_host
-        try:
-            host = console.input(f"Server host [{default_host}]: ").strip() or default_host
-        except Exception:
-            host = default_host
-        port = IntPrompt.ask("Server port", default=default_port)
-        net_cfg = NetworkConfig(enabled=True, host=host, port=port)
-
-    mic_index: Optional[int] = None
-    if features.voice:
-        ans = _select_one(
-            console,
-            "Microphone",
-            [
-                ("auto", "Use default microphone device"),
-                ("index", "Specify a microphone device index"),
-            ],
-        )
-        if ans == "index":
-            mic_index = IntPrompt.ask("Mic index", default=0)
-
-    _header(console)
-    console.print(Panel("Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
-    time.sleep(0.6)
-
-    return run_live_dashboard_tui(dry_run=dry_run, features=features, mic_index=mic_index, peak=peak, net=net_cfg)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Optional, Set, Tuple
 
 from camera_control import CameraConfig, CameraController
-from ir_control import IRConfig, IRController
 from movement import DriveConfig, SkidSteerDrive, build_motors, load_motor_pins, mix_throttle_steer, run_motor_test
 from voice_control import VoiceConfig, VoiceController
 
@@ -19,6 +18,9 @@ class RuntimeState:
     autonomous: bool = False
     manual_throttle: float = 0.0
     manual_steer: float = 0.0
+    voice_active: bool = False
+    voice_throttle: float = 0.0
+    voice_steer: float = 0.0
 
 
 class PynputKeys:
@@ -92,34 +94,50 @@ def _apply_command(state: RuntimeState, cmd: Tuple[str, Optional[int]]) -> None:
 
     if name == "forward":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 1.0
+        state.voice_steer = 0.0
         state.manual_throttle = 1.0
         state.manual_steer = 0.0
         return
 
     if name == "backward":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = -1.0
+        state.voice_steer = 0.0
         state.manual_throttle = -1.0
         state.manual_steer = 0.0
         return
 
     if name == "left":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = -1.0
         state.manual_steer = -1.0
         return
 
     if name == "right":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = 1.0
         state.manual_steer = 1.0
         return
 
     if name == "stop":
         state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
         state.manual_throttle = 0.0
         state.manual_steer = 0.0
         return
 
     if name == "autonomous_on":
         state.autonomous = False
+        state.voice_active = False
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
         return
 
     if name == "autonomous_off":
@@ -131,6 +149,10 @@ def _apply_command(state: RuntimeState, cmd: Tuple[str, Optional[int]]) -> None:
         if not state.autonomous:
             state.manual_throttle = 0.0
             state.manual_steer = 0.0
+        else:
+            state.voice_active = False
+            state.voice_throttle = 0.0
+            state.voice_steer = 0.0
         return
 
     if name == "speed" and isinstance(val, int):
@@ -191,20 +213,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     keys.start()
 
     voice_q: "queue.Queue[Tuple[str, Optional[int]]]" = queue.Queue()
-    ir_q: "queue.Queue[Tuple[str, Optional[int]]]" = queue.Queue()
-
     vc = VoiceController(voice_q, VoiceConfig(mic_device_index=args.mic))
     if vc.available:
         vc.start()
         print("Voice: enabled")
     else:
-        print("Voice: unavailable (SpeechRecognition/PyAudio not installed)")
+        print("Voice: unavailable (Vosk/sounddevice/model missing)")
 
-    irc = IRController(IRConfig())
-    if irc.available:
-        print("IR: enabled (requires LIRC configured)")
-    else:
-        print("IR: unavailable (python-lirc not installed)")
+    irc = None
+    print("IR: skipped (unsupported 2-pin GPIO receiver)")
 
     cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55))
     if cam.available:
@@ -251,20 +268,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             except queue.Empty:
                 pass
 
-            # IR commands
-            if irc.available:
-                for code in irc.poll_codes():
-                    cmd = irc.parse_code(code)
-                    if cmd:
-                        ir_q.put(cmd)
-
-            try:
-                while True:
-                    cmd = ir_q.get_nowait()
-                    _apply_command(state, cmd)
-            except queue.Empty:
-                pass
-
             if state.autonomous:
                 target_left = 0.0
                 target_right = 0.0
@@ -276,8 +279,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     state.manual_throttle = max(-1.0, min(1.0, throttle))
                     state.manual_steer = max(-1.0, min(1.0, steer))
                 else:
-                    state.manual_throttle = 0.0
-                    state.manual_steer = 0.0
+                    if state.voice_active:
+                        state.manual_throttle = state.voice_throttle
+                        state.manual_steer = state.voice_steer
+                    else:
+                        state.manual_throttle = 0.0
+                        state.manual_steer = 0.0
 
                 target_left, target_right = mix_throttle_steer(
                     state.manual_throttle,
