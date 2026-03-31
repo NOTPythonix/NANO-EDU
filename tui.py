@@ -26,7 +26,6 @@ def _require_rich():
         from rich.layout import Layout  # noqa: F401
         from rich.live import Live  # noqa: F401
         from rich.panel import Panel  # noqa: F401
-        from rich.prompt import IntPrompt  # noqa: F401
         from rich.table import Table  # noqa: F401
 
         return True
@@ -47,7 +46,6 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.prompt import IntPrompt
 from rich.table import Table
 from rich.text import Text
 
@@ -134,7 +132,7 @@ def _detect_local_ip(preferred_peer: Optional[str] = None) -> str:
 def _drain_stdin() -> None:
     """Best-effort drain of buffered keypresses.
 
-    We use pynput for menus (global hook), but we don't consume stdin. Arrow keys / Enter
+    We use keyboard for menus (global hook), but we don't consume stdin. Arrow keys / Enter
     can remain buffered and then get interpreted by the shell after we exit (e.g. PowerShell
     history navigation + accidental command execution). Draining stdin prevents that.
     """
@@ -245,14 +243,14 @@ class RuntimeState:
     voice_steer: float = 0.0
 
 
-class PynputKeys:
+class KeyboardKeys:
     def __init__(self):
         try:
-            from pynput import keyboard as pynput_keyboard  # type: ignore
+            import keyboard as keyboard_lib  # type: ignore
         except Exception as e:
-            raise RuntimeError("pynput is required for live mode. Install with: pip install pynput") from e
+            raise RuntimeError("keyboard is required for live mode. Install with: pip install keyboard") from e
 
-        self._kb = pynput_keyboard
+        self._kb = keyboard_lib
         self._pressed: Set[str] = set()
         self._lock = threading.Lock()
         self._listener = None
@@ -261,67 +259,40 @@ class PynputKeys:
     def start(self) -> None:
         kb = self._kb
 
-        def norm(key) -> Optional[str]:
-            try:
-                if hasattr(key, "char") and key.char:
-                    return str(key.char).lower()
-            except Exception:
-                pass
-            if key == kb.Key.up:
-                return "up"
-            if key == kb.Key.down:
-                return "down"
-            if key == kb.Key.left:
-                return "left"
-            if key == kb.Key.right:
-                return "right"
-            if key == kb.Key.enter:
-                return "enter"
-            if key == kb.Key.esc:
-                return "esc"
-            if key == kb.Key.space:
-                return "space"
+        def normalize_name(name: Any) -> Optional[str]:
+            text = str(name or "").strip().lower()
+            if not text:
+                return None
+            if text in {"up", "down", "left", "right", "enter", "esc", "space"}:
+                return text
+            if len(text) == 1:
+                return text
             return None
 
-        def on_press(key) -> None:
-            k = norm(key)
-            if k is None:
+        def on_event(event) -> None:
+            try:
+                event_type = str(getattr(event, "event_type", "")).lower()
+                if event_type not in {"down", "up"}:
+                    return
+                key_name = normalize_name(getattr(event, "name", None))
+                if key_name is None:
+                    return
+                with self._lock:
+                    if event_type == "down":
+                        self._pressed.add(key_name)
+                        self._events.put(("down", key_name))
+                    else:
+                        self._pressed.discard(key_name)
+                        self._events.put(("up", key_name))
+            except Exception:
                 return
-            with self._lock:
-                was_down = k in self._pressed
-                self._pressed.add(k)
-            if not was_down:
-                self._events.put(("down", k))
 
-        def on_release(key) -> None:
-            k = norm(key)
-            if k is None:
-                return
-            with self._lock:
-                self._pressed.discard(k)
-            self._events.put(("up", k))
-
-        listener_kwargs: Dict[str, Any] = {"on_press": on_press, "on_release": on_release}
-        if sys.platform.startswith("linux"):
-            # On Linux terminals, arrow keys can also be interpreted by the TTY,
-            # causing viewport jitter while the TUI is running.
-            listener_kwargs["suppress"] = True
-
-        try:
-            self._listener = kb.Listener(**listener_kwargs)
-        except TypeError:
-            listener_kwargs.pop("suppress", None)
-            self._listener = kb.Listener(**listener_kwargs)
-        self._listener.start()
+        self._listener = kb.hook(on_event)
 
     def stop(self) -> None:
         if self._listener is not None:
             try:
-                self._listener.stop()
-            except Exception:
-                pass
-            try:
-                self._listener.join(timeout=0.5)
+                self._kb.unhook(self._listener)
             except Exception:
                 pass
             self._listener = None
@@ -412,15 +383,6 @@ def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
         return
 
 
-def _try_create_menu_keys() -> Optional[PynputKeys]:
-    try:
-        k = PynputKeys()
-        k.start()
-        return k
-    except Exception:
-        return None
-
-
 def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> Panel:
     t = Table(box=box.SIMPLE, show_header=False, expand=True)
     t.add_column("sel", width=2)
@@ -438,21 +400,8 @@ def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> P
 
 
 def _select_one(console: Console, title: str, options: list[tuple[str, str]]) -> str:
-    # Arrow-key selection via pynput (preferred). If pynput isn't available, fall back.
-    keys = _try_create_menu_keys()
-    if keys is None:
-        table = Table(title=title, box=box.SIMPLE_HEAVY)
-        table.add_column("#", style="bold cyan", justify="right")
-        table.add_column("Option", style="bold")
-        table.add_column("Description", style="dim")
-        for i, (key, desc) in enumerate(options, start=1):
-            table.add_row(str(i), key, desc)
-        console.print(Panel(table, border_style="bright_blue"))
-        while True:
-            choice = IntPrompt.ask("Select", default=1)
-            if 1 <= choice <= len(options):
-                return options[choice - 1][0]
-
+    keys = KeyboardKeys()
+    keys.start()
     selected = 0
     try:
         console.clear()
@@ -510,11 +459,8 @@ def _select_checklist(
     *,
     default_checked: Optional[set[str]] = None,
 ) -> set[str]:
-    keys = _try_create_menu_keys()
-    if keys is None:
-        # Fallback: no checkbox UI; return nothing selected.
-        return set(default_checked or set())
-
+    keys = KeyboardKeys()
+    keys.start()
     checked: set[str] = set(default_checked or set())
     selected = 0
 
@@ -768,7 +714,7 @@ def run_live_dashboard_tui(
         full_speed=False,
     )
 
-    keys = PynputKeys()
+    keys = KeyboardKeys()
     keys.start()
 
     state = RuntimeState(speed_setting=max(0.0, min(1.0, float(peak))), max_speed_setting=max(0.0, min(1.0, float(peak))))

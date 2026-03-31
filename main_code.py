@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Set, Tuple
+from typing import Any, Optional, Set, Tuple
 
 from camera_control import CameraConfig, CameraController
 from movement import DriveConfig, SkidSteerDrive, build_motors, load_motor_pins, mix_throttle_steer, run_motor_test
@@ -23,14 +23,14 @@ class RuntimeState:
     voice_steer: float = 0.0
 
 
-class PynputKeys:
+class KeyboardKeys:
     def __init__(self):
         try:
-            from pynput import keyboard as pynput_keyboard  # type: ignore
+            import keyboard as keyboard_lib  # type: ignore
         except Exception as e:
-            raise RuntimeError("pynput is required for keyboard control. Install with: pip install pynput") from e
+            raise RuntimeError("keyboard is required for keyboard control. Install with: pip install keyboard") from e
 
-        self._kb = pynput_keyboard
+        self._kb = keyboard_lib
         self._pressed: Set[str] = set()
         self._lock = threading.Lock()
         self._listener = None
@@ -40,43 +40,51 @@ class PynputKeys:
     def start(self) -> None:
         kb = self._kb
 
-        def norm(key) -> Optional[str]:
-            try:
-                if hasattr(key, "char") and key.char:
-                    return str(key.char).lower()
-            except Exception:
-                pass
-            if key == kb.Key.space:
-                return "space"
+        def normalize_name(name: Any) -> Optional[str]:
+            text = str(name or "").strip().lower()
+            if not text:
+                return None
+            if text in {"up", "down", "left", "right", "enter", "esc", "space"}:
+                return text
+            if len(text) == 1:
+                return text
             return None
 
-        def on_press(key) -> None:
-            k = norm(key)
-            if k is None:
+        def on_event(event) -> None:
+            try:
+                event_type = str(getattr(event, "event_type", "")).lower()
+                if event_type not in {"down", "up"}:
+                    return
+                key_name = normalize_name(getattr(event, "name", None))
+                if key_name is None:
+                    return
+                with self._lock:
+                    if event_type == "down":
+                        self._pressed.add(key_name)
+                        self._events.put(("down", key_name))
+                    else:
+                        self._pressed.discard(key_name)
+                        self._events.put(("up", key_name))
+            except Exception:
                 return
-            with self._lock:
-                was_down = k in self._pressed
-                self._pressed.add(k)
-            if not was_down:
-                self._events.put(("down", k))
 
-        def on_release(key) -> None:
-            k = norm(key)
-            if k is None:
-                return
-            with self._lock:
-                self._pressed.discard(k)
-            self._events.put(("up", k))
-
-        self._listener = kb.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
+        self._listener = kb.hook(on_event)
 
     def stop(self) -> None:
         if self._listener is not None:
             try:
-                self._listener.stop()
+                self._kb.unhook(self._listener)
             except Exception:
                 pass
+            try:
+                self._kb.unhook_all_hotkeys()
+            except Exception:
+                pass
+            try:
+                self._kb.unhook_all()
+            except Exception:
+                pass
+            self._listener = None
 
     def snapshot(self) -> Set[str]:
         with self._lock:
@@ -162,7 +170,7 @@ def _apply_command(state: RuntimeState, cmd: Tuple[str, Optional[int]]) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Robot controller (refactored modules; pynput keyboard only)")
+    parser = argparse.ArgumentParser(description="Robot controller (refactored modules; keyboard only)")
     parser.add_argument("--test", action="store_true", help="run motor test (forward+reverse ramp per motor)")
     parser.add_argument("--dry-run", "--dry_run", action="store_true", help="run without GPIO; print motor commands")
     parser.add_argument(
@@ -209,7 +217,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         full_speed=bool(args.full_speed),
     )
 
-    keys = PynputKeys()
+    keys = KeyboardKeys()
     keys.start()
 
     voice_q: "queue.Queue[Tuple[str, Optional[int]]]" = queue.Queue()

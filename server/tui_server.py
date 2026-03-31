@@ -13,7 +13,7 @@ if ROOT_DIR not in sys.path:
 from net_server import JsonLineRobotServer
 from inference import infer_from_jpeg_b64
 from rtsp_web import RtspWebUi
-from tui import ErrorMessageQueue, PynputKeys, _ellipsize, _motor_label, _select_one, build_info_grid, ui_on_off
+from tui import ErrorMessageQueue, KeyboardKeys, _ellipsize, _motor_label, _select_one, build_info_grid, ui_on_off
 from ui_layout import allocate_round_robin_heights
 
 
@@ -118,7 +118,7 @@ def _age_s(now: float, ts: Optional[float]) -> str:
 
 
 def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
-    keys = PynputKeys()
+    keys = KeyboardKeys()
     keys.start()
 
     def panel() -> Panel:
@@ -150,7 +150,7 @@ def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
 
 
 def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optional[RtspWebUi] = None) -> int:
-    keys = PynputKeys()
+    keys = KeyboardKeys()
     keys.start()
 
     cmd = ServerCmdState()
@@ -526,7 +526,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
 def run_remote_motor_test(console: Console, srv: JsonLineRobotServer, *, peak: float, cycles_per_motor: int) -> int:
     """Remote motor test: server drives individual motors by sending raw_motors to the client."""
 
-    keys = PynputKeys()
+    keys = KeyboardKeys()
     keys.start()
 
     peak = max(0.0, min(1.0, float(peak)))
