@@ -287,7 +287,10 @@ class KeyboardKeys:
             except Exception:
                 return
 
-        self._listener = kb.hook(on_event)
+        try:
+            self._listener = kb.hook(on_event, suppress=sys.platform.startswith("linux"))
+        except TypeError:
+            self._listener = kb.hook(on_event)
 
     def stop(self) -> None:
         if self._listener is not None:
