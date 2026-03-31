@@ -150,6 +150,33 @@ def _drain_stdin() -> None:
     except Exception:
         pass
 
+
+def _silence_terminal(fd: int):
+    if sys.platform.startswith("win"):
+        return None
+    try:
+        import termios  # type: ignore
+    except Exception:
+        return None
+    try:
+        attrs = termios.tcgetattr(fd)
+        new = list(attrs)
+        new[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return attrs
+    except Exception:
+        return None
+
+
+def _restore_terminal(fd: int, attrs) -> None:
+    if sys.platform.startswith("win") or attrs is None:
+        return
+    try:
+        import termios  # type: ignore
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except Exception:
+        pass
+
     # POSIX best-effort
     try:
         import select
@@ -406,8 +433,15 @@ def _select_one(console: Console, title: str, options: list[tuple[str, str]]) ->
     keys = KeyboardKeys()
     keys.start()
     selected = 0
+    fd = None
+    old_attrs = None
     try:
         console.clear()
+        try:
+            fd = sys.stdin.fileno()
+            old_attrs = _silence_terminal(fd)
+        except Exception:
+            fd = None
         with Live(_render_menu(title, options, selected), console=console, refresh_per_second=30, screen=True) as live:
             while True:
                 ev = keys.poll_event()
@@ -429,6 +463,11 @@ def _select_one(console: Console, title: str, options: list[tuple[str, str]]) ->
     except KeyboardInterrupt:
         raise SystemExit(130)
     finally:
+        try:
+            if fd is not None:
+                _restore_terminal(fd, old_attrs)
+        except Exception:
+            pass
         try:
             keys.stop()
         except Exception:
@@ -466,9 +505,16 @@ def _select_checklist(
     keys.start()
     checked: set[str] = set(default_checked or set())
     selected = 0
+    fd = None
+    old_attrs = None
 
     try:
         console.clear()
+        try:
+            fd = sys.stdin.fileno()
+            old_attrs = _silence_terminal(fd)
+        except Exception:
+            fd = None
         with Live(_render_checklist(title, options, selected, checked), console=console, refresh_per_second=30, screen=True) as live:
             while True:
                 ev = keys.poll_event()
@@ -496,6 +542,11 @@ def _select_checklist(
     except KeyboardInterrupt:
         raise SystemExit(130)
     finally:
+        try:
+            if fd is not None:
+                _restore_terminal(fd, old_attrs)
+        except Exception:
+            pass
         try:
             keys.stop()
         except Exception:
@@ -1096,7 +1147,14 @@ def run_live_dashboard_tui(
         layout["debug_right"]["camera"].size = camera_panel_h
         layout["debug_right"]["ir"].size = ir_panel_h
 
+    fd = None
+    old_attrs = None
     try:
+        try:
+            fd = sys.stdin.fileno()
+            old_attrs = _silence_terminal(fd)
+        except Exception:
+            fd = None
         with Live(layout, console=console, refresh_per_second=20, screen=True):
             while True:
                 now = time.time()
@@ -1534,6 +1592,11 @@ def run_live_dashboard_tui(
         return 0
 
     finally:
+        try:
+            if fd is not None:
+                _restore_terminal(fd, old_attrs)
+        except Exception:
+            pass
         try:
             keys.stop()
         except Exception:
