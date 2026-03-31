@@ -680,9 +680,17 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
         )
     )
 
+    fd = None
+    old_attrs = None
     try:
         def panel() -> Panel:
             return Panel(render_table(), title="Motor Test", border_style="bright_green")
+
+        try:
+            fd = sys.stdin.fileno()
+            old_attrs = _silence_terminal(fd)
+        except Exception:
+            fd = None
 
         with Live(panel(), console=console, refresh_per_second=20) as live:
             def update_ui() -> None:
@@ -702,6 +710,11 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
         console.print(Panel("[bold yellow]Interrupted. Motors stopped.[/]", border_style="yellow"))
         return 130
     finally:
+        try:
+            if fd is not None:
+                _restore_terminal(fd, old_attrs)
+        except Exception:
+            pass
         try:
             cleanup()
         except Exception:
