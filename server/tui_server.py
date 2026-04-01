@@ -13,7 +13,7 @@ if ROOT_DIR not in sys.path:
 from net_server import JsonLineRobotServer
 from inference import infer_from_jpeg_b64
 from rtsp_web import RtspWebUi
-from tui import ErrorMessageQueue, KeyboardKeys, _ellipsize, _motor_label, _select_one, build_info_grid, ui_on_off
+from tui import ErrorMessageQueue, KeyboardKeys, _ellipsize, _motor_label, _select_one, build_info_grid, build_motor_table_from_telemetry, ui_on_off
 from ui_layout import allocate_round_robin_heights
 
 
@@ -63,52 +63,6 @@ class ServerCmdState:
 def _header(console: Console) -> None:
     console.clear()
     console.print(Align.center("[bold bright_cyan]HSEF Robot Control[/]  [dim]SERVER TUI[/]"))
-
-
-def _motor_table_from_telemetry(tlm: dict[str, Any]) -> Table:
-    motors: dict[str, Any] = {}
-    try:
-        motors = dict(tlm.get("motors") or {})
-    except Exception:
-        motors = {}
-
-    t = Table(box=box.SIMPLE, expand=True, pad_edge=False, padding=(0, 1))
-    t.add_column("Motor", style="bold cyan", no_wrap=True, overflow="ellipsis")
-    t.add_column("Cmd", justify="right", no_wrap=True)
-    t.add_column("Inv", justify="center", no_wrap=True)
-    t.add_column("Dir", justify="center", no_wrap=True, width=4)
-    t.add_column("Power", justify="left", no_wrap=True, width=12)
-
-    def dir_of(s: float) -> str:
-        if abs(s) < 1e-3:
-            return "STOP"
-        return "FWD" if s > 0 else "REV"
-
-    def bar(s: float) -> str:
-        mag = max(0.0, min(1.0, abs(float(s))))
-        blocks = int(round(mag * 10))
-        fill = "█" * blocks
-        empty = "░" * (10 - blocks)
-        color = "green" if s > 0 else ("red" if s < 0 else "white")
-        return f"[{color}]{fill}{empty}[/]"
-
-    preferred = ["lf", "lr", "rf", "rr"]
-    ordered = [n for n in preferred if n in motors] + [n for n in sorted(motors.keys()) if n not in preferred]
-
-    for name in ordered:
-        m = motors.get(name) or {}
-        try:
-            s = float(m.get("speed", 0.0))
-        except Exception:
-            s = 0.0
-        inv = bool(m.get("invert", False))
-        d = f"{dir_of(s):<4}"[:4]
-        t.add_row(f"{_motor_label(name)} ({name})", f"{s:+.2f}", "Y" if inv else "N", d, bar(s))
-
-    if not ordered:
-        t.add_row("—", "0.00", "—", "STOP", bar(0.0))
-
-    return t
 
 
 def _age_s(now: float, ts: Optional[float]) -> str:
@@ -504,7 +458,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                 message, message_until = error_messages.next_message(now_s=now, current=message, current_until=message_until, ready="Ready.")
 
                 layout["top"].update(top_panel())
-                layout["motors"].update(Panel(_motor_table_from_telemetry(tlm), title="Motors", border_style="bright_green"))
+                layout["motors"].update(Panel(build_motor_table_from_telemetry(tlm, now_s=now), title="Motors", border_style="bright_green"))
                 layout["status"].update(status_panel(now, tlm))
                 layout["auto"].update(auto_panel(now, tlm))
                 layout["voice"].update(voice_panel(tlm))

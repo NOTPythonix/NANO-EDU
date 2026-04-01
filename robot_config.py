@@ -13,10 +13,10 @@ from __future__ import annotations
 # User confirmed these are BCM GPIO numbers on the real Pi.
 # If any are wrong, the GPIO backend should fail fast rather than auto-detect.
 MOTORS = {
-    "lf": {"in1": 11, "in2": 14, "en": 15},
-    "rr": {"in1": 20, "in2": 16, "en": 23},
-    "rf": {"in1": 26, "in2": 19, "en": 13},
-    "lr": {"in1": 31, "in2": 29, "en": 12},
+    "lf": {"in1": 5, "in2": 6, "en": 12},
+    "rr": {"in1": 16, "in2": 20, "en": 13},
+    "rf": {"in1": 17, "in2": 27, "en": 18},
+    "lr": {"in1": 22, "in2": 23, "en": 19},
 }
 
 # --- Direction correction ---

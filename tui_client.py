@@ -6,10 +6,10 @@ from typing import Optional
 
 from tui import (
     FeatureFlags,
-    NetworkConfig,
     _header,
     _select_checklist,
     _select_one,
+    NetworkConfig,
     run_live_dashboard_tui,
     run_motor_test_tui,
 )

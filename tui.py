@@ -14,6 +14,7 @@ from camera_control import CameraConfig, CameraController
 from movement import DriveConfig, Motor, SkidSteerDrive, build_motors, load_motor_pins, mix_throttle_steer
 from robot_net import JsonLineLink
 from rtsp_stream import RtspStreamConfig, RtspStreamPublisher
+import robot_config
 from ui_layout import allocate_round_robin_heights
 from voice_control import VoiceConfig, VoiceController
 
@@ -46,6 +47,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.prompt import IntPrompt
 from rich.table import Table
 from rich.text import Text
 
@@ -60,6 +62,28 @@ def _motor_label(short: str) -> str:
         "rf": "Right Front",
         "rr": "Right Rear",
     }.get(short, short)
+
+
+def _motor_pins(name: str, pins: Optional[Dict[str, int]] = None) -> str:
+    source = pins or dict(robot_config.MOTORS.get(name, {}))
+    if not source:
+        return "—"
+    return f"IN1 {source.get('in1', '—')} / IN2 {source.get('in2', '—')} / EN {source.get('en', '—')}"
+
+
+def _marquee(text: str, width: int, offset: float, gap: int = 4) -> str:
+    s = str(text)
+    width = max(1, int(width))
+    if len(s) <= width:
+        return s.ljust(width)
+
+    spacer = " " * max(1, int(gap))
+    cycle = s + spacer
+    pos = int(offset) % len(cycle)
+    window = cycle[pos : pos + width]
+    if len(window) < width:
+        window += cycle[: width - len(window)]
+    return window
 
 
 def _ellipsize(s: str, max_len: int) -> str:
@@ -87,10 +111,6 @@ def ui_on_off_error(state: str) -> str:
 
 
 def build_info_grid(rows: list[tuple[str, str]]) -> Table:
-    """Shared two-column row renderer for client/server panels."""
-
-    # Keep a small explicit gap between columns so long error values don't
-    # visually merge into keys on narrower terminals.
     grid = Table.grid(expand=True, pad_edge=False, padding=(0, 1))
     grid.add_column(style="bold", no_wrap=True)
     grid.add_column(no_wrap=True, overflow="ellipsis", ratio=1, justify="right")
@@ -99,148 +119,9 @@ def build_info_grid(rows: list[tuple[str, str]]) -> Table:
     return grid
 
 
-def _detect_local_ip(preferred_peer: Optional[str] = None) -> str:
-    """Best-effort local IPv4 for status/telemetry display."""
-
-    targets: list[tuple[str, int]] = []
-    if preferred_peer:
-        try:
-            targets.append((str(preferred_peer), 1))
-        except Exception:
-            pass
-    targets.extend([
-        ("8.8.8.8", 80),
-        ("1.1.1.1", 80),
-    ])
-
-    for host, port in targets:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect((host, int(port)))
-                ip = s.getsockname()[0]
-                if ip:
-                    return str(ip)
-            finally:
-                s.close()
-        except Exception:
-            continue
-
-    return "127.0.0.1"
-
-
-def _drain_stdin() -> None:
-    """Best-effort drain of buffered keypresses.
-
-    We use keyboard for menus (global hook), but we don't consume stdin. Arrow keys / Enter
-    can remain buffered and then get interpreted by the shell after we exit (e.g. PowerShell
-    history navigation + accidental command execution). Draining stdin prevents that.
-    """
-
-    try:
-        if sys.platform.startswith("win"):
-            import msvcrt  # type: ignore
-
-            while msvcrt.kbhit():
-                try:
-                    msvcrt.getwch()
-                except Exception:
-                    break
-            return
-    except Exception:
-        pass
-
-
-def _silence_terminal(fd: int):
-    if sys.platform.startswith("win"):
-        return None
-    try:
-        import termios  # type: ignore
-    except Exception:
-        return None
-    try:
-        attrs = termios.tcgetattr(fd)
-        new = list(attrs)
-        new[3] &= ~(termios.ECHO | termios.ICANON)
-        termios.tcsetattr(fd, termios.TCSANOW, new)
-        return attrs
-    except Exception:
-        return None
-
-
-def _restore_terminal(fd: int, attrs) -> None:
-    if sys.platform.startswith("win") or attrs is None:
-        return
-    try:
-        import termios  # type: ignore
-        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
-    except Exception:
-        pass
-
-    # POSIX best-effort
-    try:
-        import select
-
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0)
-            if not r:
-                break
-            sys.stdin.read(1)
-    except Exception:
-        pass
-
-
-class ErrorMessageQueue:
-    """Timed error queue with source de-duplication."""
-
-    def __init__(self, *, display_s: float = 3.0):
-        self._display_s = float(display_s)
-        self._seq = 0
-        self._pending: list[tuple[int, int, str]] = []
-        self._last_by_source: Dict[str, str] = {}
-
-    def feed(
-        self,
-        source: str,
-        err: Optional[str],
-        *,
-        now_s: float,
-        prefix: str,
-        priority: int,
-        label: Optional[str] = None,
-    ) -> None:
-        src = str(source)
-        txt = str(err or "").strip()
-
-        if not txt or txt == "—":
-            return
-
-        shown_label = str(label or src)
-        shown = f"{str(prefix)} {shown_label}: {txt}".strip()
-        p = int(priority)
-
-        prev = self._last_by_source.get(src, "")
-        if txt != prev:
-            self._pending.append((p, self._seq, shown))
-            self._seq += 1
-            self._last_by_source[src] = txt
-
-    def next_message(self, *, now_s: float, current: str, current_until: float, ready: str = "Ready.") -> tuple[str, float]:
-        if current_until and float(now_s) < float(current_until):
-            return current, current_until
-
-        if self._pending:
-            # Highest priority first; FIFO within same priority.
-            best_i = 0
-            best = self._pending[0]
-            for i, item in enumerate(self._pending[1:], start=1):
-                if item[0] > best[0] or (item[0] == best[0] and item[1] < best[1]):
-                    best_i = i
-                    best = item
-            self._pending.pop(best_i)
-            return best[2], float(now_s) + self._display_s
-
-        return str(ready), 0.0
+def _header(console: Console) -> None:
+    console.clear()
+    console.print(Align.center("[bold bright_cyan]HSEF Robot Control[/]  [dim]TUI[/]"))
 
 
 @dataclass
@@ -261,7 +142,7 @@ class NetworkConfig:
 @dataclass
 class RuntimeState:
     speed_setting: float = 0.65
-    max_speed_setting: float = 1.0
+    max_speed_setting: float = 0.65
     autonomous: bool = False
     manual_throttle: float = 0.0
     manual_steer: float = 0.0
@@ -284,8 +165,6 @@ class KeyboardKeys:
         self._events: "queue.Queue[Tuple[str, str]]" = queue.Queue()
 
     def start(self) -> None:
-        kb = self._kb
-
         def normalize_name(name: Any) -> Optional[str]:
             text = str(name or "").strip().lower()
             if not text:
@@ -315,9 +194,11 @@ class KeyboardKeys:
                 return
 
         try:
-            self._listener = kb.hook(on_event, suppress=sys.platform.startswith("linux"))
+            self._listener = self._kb.hook(on_event, suppress=False)
         except TypeError:
-            self._listener = kb.hook(on_event)
+            self._listener = self._kb.hook(on_event)
+        except Exception:
+            self._listener = self._kb.hook(on_event)
 
     def stop(self) -> None:
         if self._listener is not None:
@@ -336,81 +217,6 @@ class KeyboardKeys:
             return self._events.get_nowait()
         except queue.Empty:
             return None
-
-
-def _apply_external_command(state: RuntimeState, cmd: ConsoleCmd) -> None:
-    name, val = cmd
-
-    if name == "forward":
-        state.autonomous = False
-        state.voice_active = True
-        state.voice_throttle = 1.0
-        state.voice_steer = 0.0
-        state.manual_throttle = 1.0
-        state.manual_steer = 0.0
-        return
-
-    if name == "backward":
-        state.autonomous = False
-        state.voice_active = True
-        state.voice_throttle = -1.0
-        state.voice_steer = 0.0
-        state.manual_throttle = -1.0
-        state.manual_steer = 0.0
-        return
-
-    if name == "left":
-        state.autonomous = False
-        state.voice_active = True
-        state.voice_steer = -1.0
-        state.manual_steer = -1.0
-        return
-
-    if name == "right":
-        state.autonomous = False
-        state.voice_active = True
-        state.voice_steer = 1.0
-        state.manual_steer = 1.0
-        return
-
-    if name == "stop":
-        state.autonomous = False
-        state.voice_active = True
-        state.voice_throttle = 0.0
-        state.voice_steer = 0.0
-        state.manual_throttle = 0.0
-        state.manual_steer = 0.0
-        return
-
-    if name == "autonomous_on":
-        state.autonomous = True
-        state.manual_throttle = 0.0
-        state.manual_steer = 0.0
-        state.voice_active = False
-        state.voice_throttle = 0.0
-        state.voice_steer = 0.0
-        return
-
-    if name == "autonomous_off":
-        state.autonomous = False
-        return
-
-    if name == "speed" and isinstance(val, int):
-        state.speed_setting = max(0.0, min(state.max_speed_setting, float(val) / 100.0))
-    
-    if name == "autonomous_toggle":
-        state.autonomous = not state.autonomous
-        if state.autonomous:
-            state.manual_throttle = 0.0
-            state.manual_steer = 0.0
-            state.voice_active = False
-            state.voice_throttle = 0.0
-            state.voice_steer = 0.0
-        else:
-            state.manual_throttle = 0.0
-            state.manual_steer = 0.0
-        return
-        return
 
 
 def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> Panel:
@@ -432,6 +238,7 @@ def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> P
 def _select_one(console: Console, title: str, options: list[tuple[str, str]]) -> str:
     keys = KeyboardKeys()
     keys.start()
+
     selected = 0
     fd = None
     old_attrs = None
@@ -464,34 +271,15 @@ def _select_one(console: Console, title: str, options: list[tuple[str, str]]) ->
         raise SystemExit(130)
     finally:
         try:
+            keys.stop()
+        except Exception:
+            pass
+        try:
             if fd is not None:
                 _restore_terminal(fd, old_attrs)
         except Exception:
             pass
-        try:
-            keys.stop()
-        except Exception:
-            pass
         _drain_stdin()
-
-
-def _render_checklist(title: str, options: list[tuple[str, str, str]], selected: int, checked: set[str]) -> Panel:
-    t = Table(box=box.SIMPLE, show_header=False, expand=True)
-    t.add_column("sel", width=2)
-    t.add_column("box", width=3)
-    t.add_column("Option", style="bold")
-    t.add_column("Description", style="dim")
-
-    for i, (key, label, desc) in enumerate(options):
-        is_sel = i == selected
-        marker = "➤" if is_sel else " "
-        box_txt = Text("[x]" if key in checked else "[ ]")
-        opt_style = "reverse bold" if is_sel else ""
-        shown_label = f"[{opt_style}]{label}[/]" if opt_style else label
-        t.add_row(marker, box_txt, shown_label, desc)
-
-    help_line = "[dim]↑/↓ move, Space toggle, Enter confirm, Q/Esc cancel[/]"
-    return Panel(t, title=title, border_style="bright_blue", subtitle=help_line)
 
 
 def _select_checklist(
@@ -501,8 +289,27 @@ def _select_checklist(
     *,
     default_checked: Optional[set[str]] = None,
 ) -> set[str]:
+    def render(title: str, options: list[tuple[str, str, str]], selected: int, checked: set[str]) -> Panel:
+        t = Table(box=box.SIMPLE, show_header=False, expand=True)
+        t.add_column("sel", width=2)
+        t.add_column("box", width=3)
+        t.add_column("Option", style="bold")
+        t.add_column("Description", style="dim")
+
+        for i, (key, label, desc) in enumerate(options):
+            is_sel = i == selected
+            marker = "➤" if is_sel else " "
+            box_txt = Text("[x]" if key in checked else "[ ]")
+            opt_style = "reverse bold" if is_sel else ""
+            shown_label = f"[{opt_style}]{label}[/]" if opt_style else label
+            t.add_row(marker, box_txt, shown_label, desc)
+
+        help_line = "[dim]↑/↓ move, Space toggle, Enter confirm, Q/Esc cancel[/]"
+        return Panel(t, title=title, border_style="bright_blue", subtitle=help_line)
+
     keys = KeyboardKeys()
     keys.start()
+
     checked: set[str] = set(default_checked or set())
     selected = 0
     fd = None
@@ -515,7 +322,7 @@ def _select_checklist(
             old_attrs = _silence_terminal(fd)
         except Exception:
             fd = None
-        with Live(_render_checklist(title, options, selected, checked), console=console, refresh_per_second=30, screen=True) as live:
+        with Live(render(title, options, selected, checked), console=console, refresh_per_second=30, screen=True) as live:
             while True:
                 ev = keys.poll_event()
                 if ev is None:
@@ -538,30 +345,74 @@ def _select_checklist(
                         checked.add(key)
                 elif k == "enter":
                     return checked
-                live.update(_render_checklist(title, options, selected, checked))
+                live.update(render(title, options, selected, checked))
     except KeyboardInterrupt:
         raise SystemExit(130)
     finally:
+        try:
+            keys.stop()
+        except Exception:
+            pass
         try:
             if fd is not None:
                 _restore_terminal(fd, old_attrs)
         except Exception:
             pass
-        try:
-            keys.stop()
-        except Exception:
-            pass
         _drain_stdin()
 
 
-def _header(console: Console) -> None:
-    console.clear()
-    console.print(
-        Align.center(
-            "[bold bright_cyan]HSEF Robot Control[/]  [dim]TUI[/]",
-            vertical="middle",
-        )
-    )
+def _drain_stdin() -> None:
+    try:
+        if sys.platform.startswith("win"):
+            import msvcrt  # type: ignore
+
+            while msvcrt.kbhit():
+                try:
+                    msvcrt.getwch()
+                except Exception:
+                    break
+            return
+    except Exception:
+        pass
+
+
+def _silence_terminal(fd: int):
+    if sys.platform.startswith("win"):
+        return None
+    try:
+        import termios  # type: ignore
+    except Exception:
+        return None
+    try:
+        attrs = termios.tcgetattr(fd)
+        new = list(attrs)
+        new[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return attrs
+    except Exception:
+        return None
+
+
+def _restore_terminal(fd: int, old_attrs) -> None:
+    if sys.platform.startswith("win") or old_attrs is None:
+        return
+    try:
+        import termios  # type: ignore
+
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except Exception:
+        pass
+
+    try:
+        import select
+
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if not r:
+                break
+            sys.stdin.read(1)
+    except Exception:
+        pass
 
 
 def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> int:
@@ -571,13 +422,11 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
     motors_cfg, _left_names, _right_names = load_motor_pins()
     motor_map, _stop_all, cleanup = build_motors(motors_cfg, dry_run=dry_run, dry_run_output=False)
 
-    # Stable order: lf, lr, rf, rr if present.
     preferred = ["lf", "lr", "rf", "rr"]
     motors: list[Motor] = [motor_map[n] for n in preferred if n in motor_map]
-    # Any extras
-    for name, m in motor_map.items():
+    for name, motor in motor_map.items():
         if name not in preferred:
-            motors.append(m)
+            motors.append(motor)
 
     peak = max(0.0, min(1.0, float(peak)))
     cycles_per_motor = max(1, int(cycles_per_motor))
@@ -585,7 +434,6 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
     off_time_s = 0.5
     step_s = 0.02
 
-    # Shared block style with the dashboard for consistency.
     def bar_fill(power_0_to_1: float, *, sign: float) -> str:
         mag = max(0.0, min(1.0, float(power_0_to_1)))
         blocks = int(round(mag * 10))
@@ -594,86 +442,83 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
         color = "green" if sign > 0 else ("red" if sign < 0 else "white")
         return f"[{color}]{fill}{empty}[/]"
 
-    def dir_of(s: float) -> str:
-        if abs(s) < 1e-3:
+    def dir_of(speed: float) -> str:
+        if abs(speed) < 1e-3:
             return "STOP"
-        return "FWD" if s > 0 else "REV"
+        return "FWD" if speed > 0 else "REV"
 
     motor_state: Dict[str, Dict[str, object]] = {}
     invert_map: Dict[str, bool] = {}
-    for m in motors:
-        motor_state[m.pins.name] = {"phase": "idle", "cmd": 0.0}
-        invert_map[m.pins.name] = bool(m.pins.invert)
+    for motor in motors:
+        motor_state[motor.pins.name] = {"phase": "idle", "cmd": 0.0}
+        invert_map[motor.pins.name] = bool(motor.pins.invert)
 
-    def set_state(m: Motor, phase: str) -> None:
-        # Pad phase to a fixed width so the bar column doesn't resize.
-        motor_state[m.pins.name]["phase"] = f"{phase:<12}"[:12]
-        motor_state[m.pins.name]["cmd"] = float(m.last_speed)
+    def set_state(motor: Motor, phase: str) -> None:
+        motor_state[motor.pins.name]["phase"] = f"{phase:<12}"[:12]
+        motor_state[motor.pins.name]["cmd"] = float(motor.last_speed)
 
     def render_table() -> Table:
-        t = Table(box=box.SIMPLE, expand=True)
-        t.add_column("Motor", style="bold cyan", width=18)
-        t.add_column("Phase", style="magenta", width=12)
-        t.add_column("Inv", justify="center", width=3)
-        t.add_column("Dir", justify="center", width=4)
-        t.add_column("Power", justify="left", width=12)
-        t.add_column("%", justify="right", width=4)
+        table = Table(box=box.SIMPLE, expand=True)
+        table.add_column("Motor", style="bold cyan", width=18)
+        table.add_column("Phase", style="magenta", width=12)
+        table.add_column("Inv", justify="center", width=3)
+        table.add_column("Dir", justify="center", width=4)
+        table.add_column("Power", justify="left", width=12)
+        table.add_column("%", justify="right", width=4)
 
-        for name in [m.pins.name for m in motors]:
-            st = motor_state[name]
+        for motor in motors:
+            st = motor_state[motor.pins.name]
             cmd = float(st["cmd"])
-            p = max(0.0, min(1.0, abs(cmd)))
-            t.add_row(
-                f"{_motor_label(name)} ({name})",
+            mag = max(0.0, min(1.0, abs(cmd)))
+            table.add_row(
+                f"{_motor_label(motor.pins.name)} ({motor.pins.name})",
                 str(st["phase"]),
-                "Y" if invert_map.get(name, False) else "N",
+                "Y" if invert_map.get(motor.pins.name, False) else "N",
                 dir_of(cmd),
-                bar_fill(p, sign=cmd),
-                f"{(p * 100.0):>3.0f}",
+                bar_fill(mag, sign=cmd),
+                f"{(mag * 100.0):>3.0f}",
             )
-        return t
+        return table
 
-    def ramp_run(m: Motor, signed_peak: float, total_s: float, update_ui) -> None:
+    def ramp_run(motor: Motor, signed_peak: float, total_s: float, update_ui) -> None:
         total_s = max(0.0, float(total_s))
         up_s = total_s / 2.0
         down_s = total_s - up_s
 
-        # Ramp up
         t0 = time.time()
         while True:
-            t = time.time() - t0
-            if t >= up_s:
+            elapsed = time.time() - t0
+            if elapsed >= up_s:
                 break
-            frac = 0.0 if up_s <= 1e-9 else (t / up_s)
-            m.set(signed_peak * frac)
-            set_state(m, "ramp up")
+            frac = 0.0 if up_s <= 1e-9 else (elapsed / up_s)
+            motor.set(signed_peak * frac)
+            set_state(motor, "ramp up")
             update_ui()
             time.sleep(step_s)
 
-        m.set(signed_peak)
-        set_state(m, "hold")
+        motor.set(signed_peak)
+        set_state(motor, "hold")
         update_ui()
 
-        # Ramp down
         t0 = time.time()
         while True:
-            t = time.time() - t0
-            if t >= down_s:
+            elapsed = time.time() - t0
+            if elapsed >= down_s:
                 break
-            frac = 0.0 if down_s <= 1e-9 else (1.0 - (t / down_s))
-            m.set(signed_peak * frac)
-            set_state(m, "ramp down")
+            frac = 0.0 if down_s <= 1e-9 else (1.0 - (elapsed / down_s))
+            motor.set(signed_peak * frac)
+            set_state(motor, "ramp down")
             update_ui()
             time.sleep(step_s)
 
-        m.stop()
-        set_state(m, "idle")
+        motor.stop()
+        set_state(motor, "idle")
         update_ui()
 
     console.print(
         Panel(
             "[bold]Motor Test[/]\n"
-            f"Each motor runs forward then reverse with a smooth ramp up/down.\n"
+            "Each motor runs forward then reverse with a smooth ramp up/down.\n"
             f"[dim]Peak: {int(round(peak * 100))}%   Cycles/motor: {cycles_per_motor}[/]\n\n"
             "[dim]Press Ctrl+C to abort safely.[/]",
             border_style="bright_green",
@@ -696,13 +541,13 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
             def update_ui() -> None:
                 live.update(panel())
 
-            for m in motors:
-                set_state(m, "idle")
+            for motor in motors:
+                set_state(motor, "idle")
                 update_ui()
                 for _ in range(cycles_per_motor):
-                    ramp_run(m, +peak, on_time_s, update_ui)
+                    ramp_run(motor, +peak, on_time_s, update_ui)
                     time.sleep(off_time_s)
-                    ramp_run(m, -peak, on_time_s, update_ui)
+                    ramp_run(motor, -peak, on_time_s, update_ui)
                     time.sleep(off_time_s)
         console.print(Panel("[bold bright_green]Done.[/]", border_style="bright_green"))
         return 0
@@ -719,15 +564,106 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
             cleanup()
         except Exception:
             pass
+        _drain_stdin()
 
 
-def _motor_table(motor_map: Dict[str, Motor]) -> Table:
-    # Use available width efficiently. We keep Dir padded to a stable 4 chars so
-    # the bar doesn't shift when switching between STOP/FWD/REV.
+def _detect_local_ip(preferred_peer: Optional[str] = None) -> str:
+    return "127.0.0.1"
+
+
+def _apply_external_command(state, cmd: ConsoleCmd) -> None:
+    name, val = cmd
+    if name == "forward":
+        state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 1.0
+        state.voice_steer = 0.0
+        state.manual_throttle = 1.0
+        state.manual_steer = 0.0
+        return
+    if name == "backward":
+        state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = -1.0
+        state.voice_steer = 0.0
+        state.manual_throttle = -1.0
+        state.manual_steer = 0.0
+        return
+    if name == "left":
+        state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = -1.0
+        state.manual_steer = -1.0
+        return
+    if name == "right":
+        state.autonomous = False
+        state.voice_active = True
+        state.voice_steer = 1.0
+        state.manual_steer = 1.0
+        return
+    if name == "stop":
+        state.autonomous = False
+        state.voice_active = True
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
+        state.manual_throttle = 0.0
+        state.manual_steer = 0.0
+        return
+    if name == "autonomous_on":
+        state.autonomous = True
+        state.manual_throttle = 0.0
+        state.manual_steer = 0.0
+        state.voice_active = False
+        state.voice_throttle = 0.0
+        state.voice_steer = 0.0
+        return
+    if name == "autonomous_off":
+        state.autonomous = False
+        return
+    if name == "speed" and isinstance(val, int):
+        state.speed_setting = max(0.0, min(state.max_speed_setting, float(val) / 100.0))
+
+
+class ErrorMessageQueue:
+    def __init__(self, *, display_s: float = 3.0):
+        self._display_s = float(display_s)
+        self._seq = 0
+        self._pending: list[tuple[int, int, str]] = []
+        self._last_by_source: Dict[str, str] = {}
+
+    def feed(self, source: str, err: Optional[str], *, now_s: float, prefix: str, priority: int, label: Optional[str] = None) -> None:
+        src = str(source)
+        txt = str(err or "").strip()
+        if not txt or txt == "—":
+            return
+        shown = f"{str(prefix)} {str(label or src)}: {txt}".strip()
+        prev = self._last_by_source.get(src, "")
+        if txt != prev:
+            self._pending.append((int(priority), self._seq, shown))
+            self._seq += 1
+            self._last_by_source[src] = txt
+
+    def next_message(self, *, now_s: float, current: str, current_until: float, ready: str = "Ready.") -> tuple[str, float]:
+        if current_until and float(now_s) < float(current_until):
+            return current, current_until
+        if self._pending:
+            best_i = 0
+            best = self._pending[0]
+            for i, item in enumerate(self._pending[1:], start=1):
+                if item[0] > best[0] or (item[0] == best[0] and item[1] < best[1]):
+                    best_i = i
+                    best = item
+            self._pending.pop(best_i)
+            return best[2], float(now_s) + self._display_s
+        return str(ready), 0.0
+
+
+def _build_motor_table(rows: list[dict[str, Any]], *, now_s: Optional[float] = None) -> Table:
     t = Table(box=box.SIMPLE, expand=True, pad_edge=False, padding=(0, 1))
-    t.add_column("Motor", style="bold cyan", no_wrap=True, overflow="ellipsis")
-    t.add_column("Cmd", justify="right", no_wrap=True)
-    t.add_column("Inv", justify="center", no_wrap=True)
+    t.add_column("Motor", style="bold cyan", no_wrap=True, overflow="ellipsis", width=15)
+    t.add_column("Pins", style="dim", no_wrap=True, overflow="ellipsis", width=10)
+    t.add_column("Cmd", justify="right", no_wrap=True, width=5)
+    t.add_column("Inv", justify="center", no_wrap=True, width=3)
     t.add_column("Dir", justify="center", no_wrap=True, width=4)
     t.add_column("Power", justify="left", no_wrap=True, width=12)
 
@@ -737,7 +673,6 @@ def _motor_table(motor_map: Dict[str, Motor]) -> Table:
         return "FWD" if s > 0 else "REV"
 
     def bar(s: float) -> str:
-        # 0..1 magnitude mapped to 10 blocks
         mag = max(0.0, min(1.0, abs(s)))
         blocks = int(round(mag * 10))
         fill = "█" * blocks
@@ -745,17 +680,45 @@ def _motor_table(motor_map: Dict[str, Motor]) -> Table:
         color = "green" if s > 0 else ("red" if s < 0 else "white")
         return f"[{color}]{fill}{empty}[/]"
 
+    marquee_offset = (float(now_s) if now_s is not None else time.time()) * 6.0
+    for i, row in enumerate(rows):
+        s = float(row.get("speed", 0.0))
+        d = f"{dir_of(s):<4}"[:4]
+        t.add_row(
+            _marquee(str(row.get("name") or ""), 15, marquee_offset + (i * 2)),
+            _marquee(str(row.get("pins") or "—"), 10, marquee_offset + (i * 3)),
+            f"{s:+.2f}"[:5],
+            "Y" if bool(row.get("invert", False)) else "N",
+            d,
+            bar(s),
+        )
+    return t
+
+
+def build_motor_table_from_motor_map(motor_map: Dict[str, Motor], *, now_s: Optional[float] = None) -> Table:
     preferred = ["lf", "lr", "rf", "rr"]
     ordered = [n for n in preferred if n in motor_map] + [n for n in sorted(motor_map.keys()) if n not in preferred]
+    rows: list[dict[str, Any]] = []
     for name in ordered:
         m = motor_map[name]
-        s = m.last_speed
-        d = dir_of(s)
-        # Pad to stable width inside the fixed-width column.
-        d = f"{d:<4}"[:4]
-        t.add_row(f"{_motor_label(name)} ({name})", f"{s:+.2f}", "Y" if m.pins.invert else "N", d, bar(s))
+        rows.append({"name": f"{_motor_label(name)} ({name})", "pins": _motor_pins(name, {"in1": m.pins.in1, "in2": m.pins.in2, "en": m.pins.en}), "speed": m.last_speed, "invert": m.pins.invert})
+    return _build_motor_table(rows, now_s=now_s)
 
-    return t
+
+def build_motor_table_from_telemetry(tlm: dict[str, Any], *, now_s: Optional[float] = None) -> Table:
+    motors: dict[str, Any] = {}
+    try:
+        motors = dict(tlm.get("motors") or {})
+    except Exception:
+        motors = {}
+    preferred = ["lf", "lr", "rf", "rr"]
+    ordered = [n for n in preferred if n in motors] + [n for n in sorted(motors.keys()) if n not in preferred]
+    rows: list[dict[str, Any]] = []
+    for name in ordered:
+        m = motors.get(name) or {}
+        pins = robot_config.MOTORS.get(name) or {}
+        rows.append({"name": f"{_motor_label(name)} ({name})", "pins": f"IN1 {pins.get('in1', '—')} / IN2 {pins.get('in2', '—')} / EN {pins.get('en', '—')}", "speed": float(m.get("speed", 0.0)) if isinstance(m, dict) else 0.0, "invert": bool(m.get("invert", False)) if isinstance(m, dict) else False})
+    return _build_motor_table(rows, now_s=now_s)
 
 
 def run_live_dashboard_tui(
@@ -842,7 +805,6 @@ def run_live_dashboard_tui(
     last_server_frame_tx = 0.0
     frames_sent = 0
 
-    # Keep local camera stream snappy while sending server inference frames at a lower rate.
     stream_interval_s = max(0.01, float(os.environ.get("ROBOT_STREAM_INTERVAL_S", "0.02")))
     server_frame_interval_s = max(0.05, float(os.environ.get("ROBOT_SERVER_FRAME_INTERVAL_S", "0.10")))
 
@@ -851,7 +813,6 @@ def run_live_dashboard_tui(
     start_t = time.time()
     last_t = time.time()
 
-    # Layout sizing (tuned for maximum usable vertical space).
     TOP_SIZE = 3
     BOTTOM_SIZE = 3
     STATUS_SIZE = 5
@@ -1592,7 +1553,7 @@ def run_live_dashboard_tui(
 
                 # Render
                 layout["top"].update(top_panel())
-                layout["motors"].update(Panel(_motor_table(motor_map), title="Motors", border_style="bright_green"))
+                layout["motors"].update(Panel(build_motor_table_from_motor_map(motor_map, now_s=time.time()), title="Motors", border_style="bright_green"))
                 layout["status"].update(status_panel())
                 layout["auto"].update(autonomous_panel())
                 layout["voice"].update(voice_panel())
