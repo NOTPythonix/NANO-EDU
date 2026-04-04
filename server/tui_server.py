@@ -6,39 +6,15 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+if __package__ is None or __package__ == "":
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if ROOT_DIR not in sys.path:
+        sys.path.insert(0, ROOT_DIR)
 
-from net_server import JsonLineRobotServer
-from inference import infer_from_jpeg_b64
-from rtsp_web import RtspWebUi
-from tui import ErrorMessageQueue, KeyboardKeys, _ellipsize, _motor_label, _select_one, build_info_grid, build_motor_table_from_telemetry, ui_on_off
+from server.net_server import JsonLineRobotServer
+from server.rtsp_web import RtspWebUi
+from tui import ErrorMessageQueue, KeyboardKeys, _motor_label, _select_one, build_detection_page_layout, build_info_grid, build_motor_table_from_telemetry, ui_on_off
 from ui_layout import allocate_round_robin_heights
-
-
-def _require_rich() -> bool:
-    try:
-        from rich import box  # noqa: F401
-        from rich.align import Align  # noqa: F401
-        from rich.console import Console  # noqa: F401
-        from rich.live import Live  # noqa: F401
-        from rich.panel import Panel  # noqa: F401
-        from rich.prompt import IntPrompt  # noqa: F401
-        from rich.table import Table  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-if not _require_rich():
-    raise SystemExit(
-        "This TUI requires the 'rich' package.\n\n"
-        "Install it with:\n"
-        "  pip install rich\n"
-    )
-
 from rich import box
 from rich.align import Align
 from rich.console import Console
@@ -62,13 +38,23 @@ class ServerCmdState:
 
 def _header(console: Console) -> None:
     console.clear()
-    console.print(Align.center("[bold bright_cyan]HSEF Robot Control[/]  [dim]SERVER TUI[/]"))
+    console.print(Align.center("[bold bright_cyan]HSEF Robot Control[/]  [dim]TUI[/]"))
 
 
 def _age_s(now: float, ts: Optional[float]) -> str:
     if ts is None:
         return "—"
     return f"{int(max(0.0, now - ts))}s"
+
+
+def _fmt_when(now: float, ts: Optional[float]) -> str:
+    if ts is None:
+        return "—"
+    try:
+        stamp = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        stamp = "—"
+    return f"{stamp} ({_age_s(now, ts)} ago)"
 
 
 def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
@@ -151,6 +137,8 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
     focus_order = ["status", "auto", "voice", "camera", "ir"]
     focused = "status"
     scroll: Dict[str, int] = {k: 0 for k in focus_order}
+    page_index = 0
+    q_down = False
 
     def set_message(msg: str, *, duration_s: float = 3.0) -> None:
         nonlocal message, message_until
@@ -222,13 +210,6 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
 
         return Panel(grid, title=title, subtitle=subtitle, border_style=_focus_border(base_border, key))
 
-    def top_panel() -> Panel:
-        return Panel(
-            "[bold]W/A/S/D[/]=drive   [bold]Space[/]=stop   [bold]O[/]=toggle autonomous   "
-            "[bold][[/]/[bold]][/]=speed cap   [bold]←/→[/]=select panel   [bold]↑/↓[/]=scroll   [bold]Q[/]=quit",
-            border_style="bright_cyan",
-        )
-
     def _rows_from_ui(tlm: dict[str, Any], key: str, fallback: list[tuple[str, str]]) -> list[tuple[str, str]]:
         ui = tlm.get("ui_rows") if isinstance(tlm, dict) else None
         sec = ui.get(key) if isinstance(ui, dict) else None
@@ -240,6 +221,19 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
             if out:
                 return out
         return fallback
+
+    def _page_name() -> str:
+        return "Controls" if page_index == 0 else "Detection"
+
+    def top_panel() -> Panel:
+        return Panel(
+            "[bold]W/A/S/D[/]=drive   [bold]Space[/]=stop   [bold]O[/]=toggle autonomous   "
+            "[bold][[/]/[bold]][/]=speed cap   [bold]←/→[/]=select panel   [bold]↑/↓[/]=scroll   [bold]Q[/]=next page   [bold]Esc[/]=quit",
+            border_style="bright_cyan",
+        )
+
+    def detection_page(now: float, analysis_state: dict[str, Any], message_text: str) -> Layout:
+        return build_detection_page_layout(now, analysis_state, message_text, page_title="Client")
 
     def status_panel(now: float, tlm: dict[str, Any]) -> Panel:
         runtime_s = int(now - start_t)
@@ -333,11 +327,11 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
 
     seq = 0
     last_obs: Optional[str] = None
-    last_obs_ts: Optional[float] = None
     last_obs_tx = 0.0
+    last_analysis_tx = 0.0
 
     try:
-        with Live(layout, console=console, refresh_per_second=20, screen=True):
+        with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
             while True:
                 now = time.time()
                 while True:
@@ -345,31 +339,39 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                     if ev is None:
                         break
                     kind, k = ev
-                    if kind != "down":
-                        continue
-                    if k == "o":
-                        cmd.autonomous = not cmd.autonomous
-                        cmd.manual_throttle = 0.0
-                        cmd.manual_steer = 0.0
-                        set_message(f"Autonomous: {'ON' if cmd.autonomous else 'OFF'}")
-                    elif k == "[":
-                        cmd.max_speed_setting = max(0.0, cmd.max_speed_setting - 0.05)
-                        cmd.speed_setting = min(cmd.speed_setting, cmd.max_speed_setting)
-                    elif k == "]":
-                        cmd.max_speed_setting = min(1.0, cmd.max_speed_setting + 0.05)
-                        cmd.speed_setting = min(cmd.max_speed_setting, cmd.speed_setting + 0.05)
-                    elif k in ("left", "right"):
-                        idx = focus_order.index(focused)
-                        if k == "left":
-                            focused = focus_order[(idx - 1) % len(focus_order)]
-                        else:
-                            focused = focus_order[(idx + 1) % len(focus_order)]
-                    elif k in ("up", "down"):
-                        delta = -1 if k == "up" else 1
-                        scroll[focused] = max(0, scroll.get(focused, 0) + delta)
+                    if kind == "down":
+                        if k == "q":
+                            if not q_down:
+                                page_index = (page_index + 1) % 2
+                                set_message(f"Page switched to {page_index + 1}/2", duration_s=1.5)
+                            q_down = True
+                        elif k == "esc":
+                            raise SystemExit(130)
+                        elif k == "o":
+                            cmd.autonomous = not cmd.autonomous
+                            cmd.manual_throttle = 0.0
+                            cmd.manual_steer = 0.0
+                            set_message(f"Autonomous: {'ON' if cmd.autonomous else 'OFF'}")
+                        elif k == "[":
+                            cmd.max_speed_setting = max(0.0, cmd.max_speed_setting - 0.05)
+                            cmd.speed_setting = min(cmd.speed_setting, cmd.max_speed_setting)
+                        elif k == "]":
+                            cmd.max_speed_setting = min(1.0, cmd.max_speed_setting + 0.05)
+                            cmd.speed_setting = min(cmd.max_speed_setting, cmd.speed_setting + 0.05)
+                        elif k in ("left", "right"):
+                            idx = focus_order.index(focused)
+                            if k == "left":
+                                focused = focus_order[(idx - 1) % len(focus_order)]
+                            else:
+                                focused = focus_order[(idx + 1) % len(focus_order)]
+                        elif k in ("up", "down"):
+                            delta = -1 if k == "up" else 1
+                            scroll[focused] = max(0, scroll.get(focused, 0) + delta)
+                    elif k == "q":
+                        q_down = False
 
                 pressed = keys.snapshot()
-                if "q" in pressed:
+                if "esc" in pressed:
                     break
 
                 cmd.emergency_stop = False
@@ -380,33 +382,34 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                     cmd.manual_steer = 0.0
                     set_message("Emergency stop.")
 
+                analysis_state = web_ui.get_latest_analysis() if web_ui else {}
+                detection_result: dict[str, Any] = analysis_state if isinstance(analysis_state, dict) else {}
+                if detection_result:
+                    obstacle = str(detection_result.get("obstacle", "unknown"))
+                    label = str(detection_result.get("label", "—") or "—")
+                    conf = float(detection_result.get("confidence", 0.0) or 0.0)
+                    if obstacle == "clear":
+                        last_obs = "clear"
+                    elif label and label not in ("—", "none"):
+                        last_obs = f"{obstacle} ({label} {conf:.2f})"
+                    else:
+                        last_obs = obstacle
+                else:
+                    last_obs = "—"
+
                 if not cmd.autonomous:
                     throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
                     steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
                     cmd.manual_throttle = max(-1.0, min(1.0, throttle))
                     cmd.manual_steer = max(-1.0, min(1.0, steer))
                 else:
-                    # Server-side autonomous: infer from streamed frames.
-                    frame = srv.session.latest_frame or {}
-                    jpeg_b64 = frame.get("jpeg_b64")
-                    if isinstance(jpeg_b64, str) and jpeg_b64:
-                        res = infer_from_jpeg_b64(jpeg_b64)
-                        cmd.manual_throttle = max(-1.0, min(1.0, float(res.throttle)))
-                        cmd.manual_steer = max(-1.0, min(1.0, float(res.steer)))
-                        if str(res.obstacle) == "clear":
-                            last_obs = "clear"
-                        else:
-                            label = str(getattr(res, "label", "—") or "—")
-                            conf = float(getattr(res, "confidence", 0.0) or 0.0)
-                            if label and label not in ("—", "none"):
-                                last_obs = f"{res.obstacle} ({label} {conf:.2f})"
-                            else:
-                                last_obs = str(res.obstacle)
-                        last_obs_ts = now
+                    # Server-side autonomous: use the latest detection result to drive.
+                    if detection_result:
+                        cmd.manual_throttle = max(-1.0, min(1.0, float(detection_result.get("throttle", 0.0))))
+                        cmd.manual_steer = max(-1.0, min(1.0, float(detection_result.get("steer", 0.0))))
                     else:
                         cmd.manual_throttle = 0.0
                         cmd.manual_steer = 0.0
-                        last_obs = "—"
 
                 seq += 1
                 srv.session.send(
@@ -425,10 +428,15 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                     }
                 )
 
-                # Push obstacle display to client (for its Autonomous panel)
-                if cmd.autonomous and (now - last_obs_tx) >= 0.5:
+                # Push obstacle display to client even while manual driving, so the
+                # camera feed still reports detections.
+                if (now - last_obs_tx) >= 0.5:
                     srv.session.send({"type": "server_obs", "ts": now, "obs": last_obs or "—"})
                     last_obs_tx = now
+
+                if (now - last_analysis_tx) >= 0.5:
+                    srv.session.send({"type": "analysis", "ts": now, "analysis": analysis_state if isinstance(analysis_state, dict) else {}})
+                    last_analysis_tx = now
 
                 tlm = srv.session.latest_telemetry or {}
 
@@ -445,6 +453,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                 cli_rtsp_err = str(cam_info.get("rtsp_error", "") if isinstance(cam_info, dict) else "")
                 cli_voice_err = str(voice_info.get("error", "") if isinstance(voice_info, dict) else "")
                 cli_ir_err = str(ir_info.get("error", "") if isinstance(ir_info, dict) else "")
+                cli_inference_err = str((analysis_state.get("error", "") or analysis_state.get("model_error", "") or "") if isinstance(analysis_state, dict) else "")
 
                 # Server-side errors first, then client-side relayed errors.
                 error_messages.feed("server.network", srv_net_err, now_s=now, prefix="[s]", priority=2, label="Network")
@@ -452,19 +461,24 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                 error_messages.feed("client.network", cli_net_err, now_s=now, prefix="[c]", priority=1, label="Network")
                 error_messages.feed("client.camera", cli_cam_err, now_s=now, prefix="[c]", priority=1, label="Camera")
                 error_messages.feed("client.stream", cli_rtsp_err, now_s=now, prefix="[c]", priority=1, label="Stream")
+                error_messages.feed("client.inference", cli_inference_err, now_s=now, prefix="[c]", priority=1, label="Inference")
                 error_messages.feed("client.voice", cli_voice_err, now_s=now, prefix="[c]", priority=1, label="Voice")
                 error_messages.feed("client.ir", cli_ir_err, now_s=now, prefix="[c]", priority=1, label="IR")
 
                 message, message_until = error_messages.next_message(now_s=now, current=message, current_until=message_until, ready="Ready.")
 
-                layout["top"].update(top_panel())
-                layout["motors"].update(Panel(build_motor_table_from_telemetry(tlm, now_s=now), title="Motors", border_style="bright_green"))
-                layout["status"].update(status_panel(now, tlm))
-                layout["auto"].update(auto_panel(now, tlm))
-                layout["voice"].update(voice_panel(tlm))
-                layout["camera"].update(camera_panel(now, tlm))
-                layout["ir"].update(ir_panel(tlm))
-                layout["bottom"].update(Panel(Text(str(message)), border_style="dim"))
+                if page_index == 0:
+                    layout["top"].update(top_panel())
+                    layout["motors"].update(Panel(build_motor_table_from_telemetry(tlm, now_s=now), title="Motors", border_style="bright_green"))
+                    layout["status"].update(status_panel(now, tlm))
+                    layout["auto"].update(auto_panel(now, tlm))
+                    layout["voice"].update(voice_panel(tlm))
+                    layout["camera"].update(camera_panel(now, tlm))
+                    layout["ir"].update(ir_panel(tlm))
+                    layout["bottom"].update(Panel(Text(str(message)), border_style="dim"))
+                else:
+                    live_page = detection_page(now, analysis_state if isinstance(analysis_state, dict) else {}, message)
+                live.update(layout if page_index == 0 else live_page)
 
                 time.sleep(0.02)
 
@@ -741,7 +755,7 @@ def main() -> int:
             return run_remote_motor_test(console, srv, peak=peak, cycles_per_motor=int(cycles_choice))
 
         _header(console)
-        console.print(Panel("Robot connected. Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
+        console.print(Panel("Robot connected. Entering dashboard...\n[dim]Press Q to switch pages. Esc quits.[/]", border_style="bright_green"))
         time.sleep(0.6)
         return run_dashboard(console, srv, web_ui=web_ui)
     finally:

@@ -6,7 +6,6 @@ import threading
 import time
 import base64
 import os
-import socket
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -18,38 +17,21 @@ import robot_config
 from ui_layout import allocate_round_robin_heights
 from voice_control import VoiceConfig, VoiceController
 
-
-def _require_rich():
-    try:
-        from rich import box  # noqa: F401
-        from rich.align import Align  # noqa: F401
-        from rich.console import Console  # noqa: F401
-        from rich.layout import Layout  # noqa: F401
-        from rich.live import Live  # noqa: F401
-        from rich.panel import Panel  # noqa: F401
-        from rich.table import Table  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-if not _require_rich():
+try:
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+except Exception as exc:
     raise SystemExit(
         "This TUI requires the 'rich' package.\n\n"
         "Install it with:\n"
         "  pip install rich\n"
-    )
-
-from rich import box
-from rich.align import Align
-from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.prompt import IntPrompt
-from rich.table import Table
-from rich.text import Text
+    ) from exc
 
 
 ConsoleCmd = Tuple[str, Optional[int]]
@@ -117,6 +99,89 @@ def build_info_grid(rows: list[tuple[str, str]]) -> Table:
     for k, v in rows:
         grid.add_row(str(k), str(v))
     return grid
+
+
+def _analysis_time_label(now_s: float, ts: Optional[float]) -> str:
+    if ts is None:
+        return "—"
+    try:
+        stamp = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        stamp = "—"
+    age_s = int(max(0.0, float(now_s) - float(ts)))
+    return f"{stamp} ({age_s}s ago)"
+
+
+def build_detection_table(analysis_state: dict[str, Any]) -> Table:
+    table = Table(box=box.SIMPLE, expand=True)
+    table.add_column("#", width=3, justify="right")
+    table.add_column("Label", style="bold cyan", overflow="ellipsis")
+    table.add_column("Conf", width=7, justify="right")
+    table.add_column("Box", overflow="ellipsis")
+
+    detections = None
+    if isinstance(analysis_state, dict):
+        detections = analysis_state.get("all_detections") or analysis_state.get("top_detections")
+    rows: list[dict[str, Any]] = list(detections) if isinstance(detections, list) else []
+    if not rows and isinstance(analysis_state, dict):
+        label = str(analysis_state.get("label", "—") or "—")
+        conf = float(analysis_state.get("confidence", 0.0) or 0.0)
+        if label not in ("—", "none", "unknown"):
+            rows = [{"label": label, "confidence": conf, "x1": "—", "y1": "—", "x2": "—", "y2": "—"}]
+
+    if not rows:
+        table.add_row("—", "No detections", "—", "—")
+        return table
+
+    for idx, det in enumerate(rows[:24], start=1):
+        label = str(det.get("label", "—"))
+        conf = float(det.get("confidence", 0.0) or 0.0)
+        box_txt = f"{det.get('x1', '—')},{det.get('y1', '—')} -> {det.get('x2', '—')},{det.get('y2', '—')}"
+        table.add_row(str(idx), label, f"{conf:.2f}", box_txt)
+    return table
+
+
+def build_detection_stats_panel(now_s: float, analysis_state: dict[str, Any]) -> Panel:
+    rows = [
+        ("Model error", str(analysis_state.get("model_error", analysis_state.get("error", "—")) or "—")),
+        ("FPS", f"{float(analysis_state.get('analysis_fps', 0.0) or 0.0):.2f}"),
+        ("Detections", str(analysis_state.get("detections", "—"))),
+        ("Raw detections", str(analysis_state.get("raw_detections", "—"))),
+        ("Analysis age", f"{analysis_state.get('age_s', '—')}s" if analysis_state.get("age_s") is not None else "—"),
+        ("Last update", _analysis_time_label(now_s, analysis_state.get("updated_ts") if isinstance(analysis_state, dict) else None)),
+        ("Phone detected", ui_on_off(bool(analysis_state.get("phone_detected", False)))),
+        ("Phone seen", _analysis_time_label(now_s, analysis_state.get("phone_detected_ts") if isinstance(analysis_state, dict) else None)),
+        ("Phone alert", ui_on_off(bool(analysis_state.get("phone_alert_triggered", False)))),
+        ("Alert when", _analysis_time_label(now_s, analysis_state.get("phone_alert_triggered_ts") if isinstance(analysis_state, dict) else None)),
+    ]
+    return Panel(build_info_grid(rows), title="Model Stats", border_style="bright_magenta")
+
+
+def build_detection_page_layout(
+    now_s: float,
+    analysis_state: dict[str, Any],
+    message_text: str,
+    *,
+    page_title: str = "Detection",
+) -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="top", size=3),
+        Layout(name="main"),
+        Layout(name="bottom", size=3),
+    )
+    layout["main"].split_row(Layout(name="detections", ratio=7), Layout(name="stats", ratio=5))
+    layout["top"].update(
+        Panel(
+            "[bold]W/A/S/D[/]=drive   [bold]Space[/]=stop   [bold]O[/]=toggle autonomous   "
+            "[bold][[/]/[bold]][/]=speed cap   [bold]←/→[/]=select panel   [bold]↑/↓[/]=scroll   [bold]Q[/]=next page   [bold]Esc[/]=quit",
+            border_style="bright_cyan",
+        )
+    )
+    layout["detections"].update(Panel(build_detection_table(analysis_state), title="Detected Objects", border_style="bright_green"))
+    layout["stats"].update(build_detection_stats_panel(now_s, analysis_state))
+    layout["bottom"].update(Panel(Text(str(message_text)), border_style="dim"))
+    return layout
 
 
 def _header(console: Console) -> None:
@@ -217,6 +282,28 @@ class KeyboardKeys:
             return self._events.get_nowait()
         except queue.Empty:
             return None
+
+
+@dataclass
+class PageNavigationState:
+    page_index: int = 0
+    q_down: bool = False
+    page_count: int = 2
+
+    def on_key_down(self, key: str) -> Optional[str]:
+        k = str(key or "").strip().lower()
+        if k == "q":
+            if not self.q_down and self.page_count > 0:
+                self.page_index = (self.page_index + 1) % self.page_count
+            self.q_down = True
+            return "page"
+        if k == "esc":
+            return "quit"
+        return None
+
+    def on_key_up(self, key: str) -> None:
+        if str(key or "").strip().lower() == "q":
+            self.q_down = False
 
 
 def _render_menu(title: str, options: list[tuple[str, str]], selected: int) -> Panel:
@@ -777,7 +864,10 @@ def run_live_dashboard_tui(
         cam_init_started = True
 
         def _worker() -> None:
-            local_cam = CameraController(CameraConfig(camera_index=0, width=320, height=240, jpeg_quality=55))
+            cam_w = max(320, int(os.environ.get("ROBOT_CAM_WIDTH", "640")))
+            cam_h = max(240, int(os.environ.get("ROBOT_CAM_HEIGHT", "480")))
+            cam_q = max(40, min(95, int(os.environ.get("ROBOT_CAM_JPEG_QUALITY", "70"))))
+            local_cam = CameraController(CameraConfig(camera_index=0, width=cam_w, height=cam_h, jpeg_quality=cam_q))
             local_rtsp: Optional[RtspStreamPublisher] = None
             local_rtsp_url = "—"
             if local_cam.available:
@@ -815,7 +905,6 @@ def run_live_dashboard_tui(
 
     TOP_SIZE = 3
     BOTTOM_SIZE = 3
-    STATUS_SIZE = 5
 
     layout = Layout()
     layout.split_column(
@@ -888,6 +977,7 @@ def run_live_dashboard_tui(
     focus_order = ["status", "auto", "voice", "camera", "ir"]
     focused = "status"
     scroll: Dict[str, int] = {k: 0 for k in focus_order}
+    page_nav = PageNavigationState(page_count=2)
 
     def _focus_border(base: str, key: str) -> str:
         return "bright_yellow" if key == focused else base
@@ -944,6 +1034,9 @@ def run_live_dashboard_tui(
 
         return Panel(grid, title=title, subtitle=subtitle, border_style=_focus_border(base_border, key))
 
+    def detection_page(now: float, state_data: dict[str, Any]) -> Layout:
+        return build_detection_page_layout(now, state_data, message, page_title="Client")
+
     last_voice_cmd: Optional[ConsoleCmd] = None
     last_voice_ts: Optional[float] = None
     last_ir_code: Optional[str] = None
@@ -952,6 +1045,7 @@ def run_live_dashboard_tui(
     # Camera is now streaming to the server; obstacle inference is server-side.
     last_obs: Optional[str] = None
     last_obs_ts: Optional[float] = None
+    analysis_state: dict[str, Any] = {}
     last_targets: Tuple[float, float] = (0.0, 0.0)
     last_mode: str = "manual"  # manual|autonomous
 
@@ -1080,7 +1174,7 @@ def run_live_dashboard_tui(
     def top_panel() -> Panel:
         return Panel(
             "[bold]W/A/S/D[/]=drive   [bold]Space[/]=stop   [bold]O[/]=toggle autonomous   "
-            "[bold][[/]/[bold]][/]=speed cap   [bold]←/→[/]=select panel   [bold]↑/↓[/]=scroll   [bold]Q[/]=quit",
+            "[bold][[/]/[bold]][/]=speed cap   [bold]←/→[/]=select panel   [bold]↑/↓[/]=scroll   [bold]Q[/]=next page   [bold]Esc[/]=quit",
             border_style="bright_cyan",
         )
 
@@ -1129,7 +1223,7 @@ def run_live_dashboard_tui(
             old_attrs = _silence_terminal(fd)
         except Exception:
             fd = None
-        with Live(layout, console=console, refresh_per_second=20, screen=True):
+        with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
             while True:
                 now = time.time()
                 recalc_layout_sizes()
@@ -1162,6 +1256,10 @@ def run_live_dashboard_tui(
                             if isinstance(obs, str):
                                 last_obs = obs
                                 last_obs_ts = now
+                        elif mtype == "analysis":
+                            data = msg.get("analysis")
+                            if isinstance(data, dict):
+                                analysis_state = data
 
                 # Remote control is considered active if we're connected and have a recent command.
                 remote_active = bool(
@@ -1177,6 +1275,16 @@ def run_live_dashboard_tui(
                     if ev is None:
                         break
                     kind, k = ev
+                    if kind == "down":
+                        nav_action = page_nav.on_key_down(k)
+                        if nav_action == "quit":
+                            raise SystemExit(130)
+                        if nav_action == "page":
+                            set_message(f"Page switched to {page_nav.page_index + 1}/2", duration_s=1.5)
+                            continue
+                    elif kind == "up":
+                        page_nav.on_key_up(k)
+
                     if kind == "down" and k == "o":
                         if remote_active:
                             set_message("Server is controlling; use server TUI")
@@ -1214,7 +1322,7 @@ def run_live_dashboard_tui(
                         scroll[focused] = max(0, scroll.get(focused, 0) + delta)
 
                 pressed = keys.snapshot()
-                if "q" in pressed:
+                if "esc" in pressed:
                     break
 
                 if "space" in pressed:
@@ -1552,14 +1660,18 @@ def run_live_dashboard_tui(
                         pass
 
                 # Render
-                layout["top"].update(top_panel())
-                layout["motors"].update(Panel(build_motor_table_from_motor_map(motor_map, now_s=time.time()), title="Motors", border_style="bright_green"))
-                layout["status"].update(status_panel())
-                layout["auto"].update(autonomous_panel())
-                layout["voice"].update(voice_panel())
-                layout["camera"].update(camera_panel())
-                layout["ir"].update(ir_panel())
-                layout["bottom"].update(bottom_panel(message))
+                if page_nav.page_index == 0:
+                    layout["top"].update(top_panel())
+                    layout["motors"].update(Panel(build_motor_table_from_motor_map(motor_map, now_s=time.time()), title="Motors", border_style="bright_green"))
+                    layout["status"].update(status_panel())
+                    layout["auto"].update(autonomous_panel())
+                    layout["voice"].update(voice_panel())
+                    layout["camera"].update(camera_panel())
+                    layout["ir"].update(ir_panel())
+                    layout["bottom"].update(bottom_panel(message))
+                    live.update(layout)
+                else:
+                    live.update(detection_page(time.time(), analysis_state))
 
                 time.sleep(0.02)
 

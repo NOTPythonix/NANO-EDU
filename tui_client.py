@@ -4,38 +4,26 @@ import os
 import time
 from typing import Optional
 
-from tui import (
-    FeatureFlags,
-    _header,
-    _select_checklist,
-    _select_one,
-    NetworkConfig,
-    run_live_dashboard_tui,
-    run_motor_test_tui,
-)
-
-
-def _require_rich() -> bool:
-    try:
-        from rich.console import Console  # noqa: F401
-        from rich.panel import Panel  # noqa: F401
-        from rich.prompt import IntPrompt  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-if not _require_rich():
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import IntPrompt
+except Exception as exc:
     raise SystemExit(
         "This TUI requires the 'rich' package.\n\n"
         "Install it with:\n"
         "  pip install rich\n"
-    )
+    ) from exc
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import IntPrompt
+from tui import (
+    FeatureFlags,
+    NetworkConfig,
+    _header,
+    _select_checklist,
+    _select_one,
+    run_live_dashboard_tui,
+    run_motor_test_tui,
+)
 
 
 def main() -> int:
@@ -140,7 +128,7 @@ def main() -> int:
             mic_index = IntPrompt.ask("Mic index", default=0)
 
     _header(console)
-    console.print(Panel("Entering dashboard...\n[dim]Press Q to quit.[/]", border_style="bright_green"))
+    console.print(Panel("Entering dashboard...\n[dim]Press Q to switch pages. Esc quits.[/]", border_style="bright_green"))
     time.sleep(0.6)
 
     return run_live_dashboard_tui(dry_run=dry_run, features=features, mic_index=mic_index, peak=peak, net=net_cfg)
