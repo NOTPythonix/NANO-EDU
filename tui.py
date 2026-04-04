@@ -6,6 +6,7 @@ import threading
 import time
 import base64
 import os
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -655,6 +656,32 @@ def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> 
 
 
 def _detect_local_ip(preferred_peer: Optional[str] = None) -> str:
+    candidates = []
+    peer = str(preferred_peer or "").strip()
+    if peer and peer not in ("0.0.0.0", "::", "localhost", "127.0.0.1"):
+        candidates.append(peer)
+    candidates.append("8.8.8.8")
+
+    for target in candidates:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect((target, 1))
+                local_ip = sock.getsockname()[0]
+            finally:
+                sock.close()
+            if local_ip and local_ip not in ("0.0.0.0", "127.0.0.1"):
+                return str(local_ip)
+        except Exception:
+            continue
+
+    try:
+        host_ip = socket.gethostbyname(socket.gethostname())
+        if host_ip and host_ip not in ("0.0.0.0", "127.0.0.1"):
+            return str(host_ip)
+    except Exception:
+        pass
+
     return "127.0.0.1"
 
 
