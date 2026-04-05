@@ -13,7 +13,20 @@ if __package__ is None or __package__ == "":
 
 from server.net_server import JsonLineRobotServer
 from server.rtsp_web import RtspWebUi
-from tui import ErrorMessageQueue, KeyboardKeys, _motor_label, _select_one, build_detection_page_layout, build_info_grid, build_motor_table_from_telemetry, ui_on_off
+from tui import (
+    DetectionPageUiState,
+    ErrorMessageQueue,
+    KeyboardKeys,
+    _motor_label,
+    _select_checklist,
+    _select_one,
+    build_detection_page_layout,
+    build_info_grid,
+    build_motor_table_from_telemetry,
+    detection_page_window_rows,
+    handle_detection_page_nav,
+    ui_on_off,
+)
 from ui_layout import allocate_round_robin_heights
 from rich import box
 from rich.align import Align
@@ -137,6 +150,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
     focus_order = ["status", "auto", "voice", "camera", "ir"]
     focused = "status"
     scroll: Dict[str, int] = {k: 0 for k in focus_order}
+    detection_ui = DetectionPageUiState()
     page_index = 0
     q_down = False
 
@@ -233,7 +247,15 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
         )
 
     def detection_page(now: float, analysis_state: dict[str, Any], message_text: str) -> Layout:
-        return build_detection_page_layout(now, analysis_state, message_text, page_title="Client")
+        return build_detection_page_layout(
+            now,
+            analysis_state,
+            message_text,
+            page_title="Client",
+            focused_panel=detection_ui.focused,
+            scroll_offsets=detection_ui.scroll,
+            window_rows=detection_page_window_rows(main_h),
+        )
 
     def status_panel(now: float, tlm: dict[str, Any]) -> Panel:
         runtime_s = int(now - start_t)
@@ -334,6 +356,27 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
         with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
             while True:
                 now = time.time()
+
+                while True:
+                    inbound = srv.session.poll()
+                    if inbound is None:
+                        break
+                    if not isinstance(inbound, dict):
+                        continue
+                    if str(inbound.get("type", "")) != "client_request":
+                        continue
+                    req = str(inbound.get("request", "")).strip().lower()
+                    if req == "autonomous_on":
+                        cmd.autonomous = True
+                        cmd.manual_throttle = 0.0
+                        cmd.manual_steer = 0.0
+                        set_message("Client voice requested autonomous ON")
+                    elif req == "autonomous_off":
+                        cmd.autonomous = False
+                        cmd.manual_throttle = 0.0
+                        cmd.manual_steer = 0.0
+                        set_message("Client voice requested autonomous OFF")
+
                 while True:
                     ev = keys.poll_event()
                     if ev is None:
@@ -359,14 +402,20 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                             cmd.max_speed_setting = min(1.0, cmd.max_speed_setting + 0.05)
                             cmd.speed_setting = min(cmd.max_speed_setting, cmd.speed_setting + 0.05)
                         elif k in ("left", "right"):
-                            idx = focus_order.index(focused)
-                            if k == "left":
-                                focused = focus_order[(idx - 1) % len(focus_order)]
+                            if page_index == 1:
+                                handle_detection_page_nav(detection_ui, k)
                             else:
-                                focused = focus_order[(idx + 1) % len(focus_order)]
+                                idx = focus_order.index(focused)
+                                if k == "left":
+                                    focused = focus_order[(idx - 1) % len(focus_order)]
+                                else:
+                                    focused = focus_order[(idx + 1) % len(focus_order)]
                         elif k in ("up", "down"):
-                            delta = -1 if k == "up" else 1
-                            scroll[focused] = max(0, scroll.get(focused, 0) + delta)
+                            if page_index == 1:
+                                handle_detection_page_nav(detection_ui, k)
+                            else:
+                                delta = -1 if k == "up" else 1
+                                scroll[focused] = max(0, scroll.get(focused, 0) + delta)
                     elif k == "q":
                         q_down = False
 
@@ -388,14 +437,25 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                     obstacle = str(detection_result.get("obstacle", "unknown"))
                     label = str(detection_result.get("label", "—") or "—")
                     conf = float(detection_result.get("confidence", 0.0) or 0.0)
-                    if obstacle == "clear":
+                    err_text = str(detection_result.get("error", "") or detection_result.get("model_error", "")).strip().lower()
+                    obs_low = obstacle.strip().lower()
+                    loading_state = (
+                        "model-unavailable" in err_text
+                        or "ultralytics unavailable" in err_text
+                        or (obs_low == "unknown" and ("model" in err_text and "unavailable" in err_text))
+                        or (obs_low == "unknown" and int(detection_result.get("raw_detections", 0) or 0) == 0 and not err_text)
+                    )
+
+                    if loading_state:
+                        last_obs = "model loading"
+                    elif obstacle == "clear":
                         last_obs = "clear"
                     elif label and label not in ("—", "none"):
                         last_obs = f"{obstacle} ({label} {conf:.2f})"
                     else:
                         last_obs = obstacle
                 else:
-                    last_obs = "—"
+                    last_obs = "model loading" if web_ui else "—"
 
                 if not cmd.autonomous:
                     throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
@@ -697,7 +757,24 @@ def main() -> int:
 
         return ""
 
-    web_ui = RtspWebUi(host=web_host, port=web_port, get_rtsp_url=_current_rtsp_url)
+    _header(console)
+    console.print(Panel("Choose optional server features.", border_style="bright_blue"))
+    picked_server = _select_checklist(
+        console,
+        "Optional Features",
+        [
+            ("alerts", "Detection Alert Emails", "Phone/Badge/Wordmark email alerts"),
+        ],
+        default_checked={"alerts"},
+    )
+    alert_emails_enabled = "alerts" in picked_server
+
+    web_ui = RtspWebUi(
+        host=web_host,
+        port=web_port,
+        get_rtsp_url=_current_rtsp_url,
+        alert_emails_enabled=alert_emails_enabled,
+    )
     try:
         web_ui.start()
     except Exception as e:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence
@@ -41,7 +42,12 @@ class FrameAnalysis:
     error: str = ""
 
 
-_MODEL_NAME_RAW = str(os.environ.get("ROBOT_YOLO_MODEL", "yolo11m.pt")).strip() or "yolo11m.pt"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_MODELS_DIR = _REPO_ROOT / "models"
+_DEFAULT_MODEL_NAME = "yoloe-26m-seg.pt"
+_MODEL_NAME_RAW = str(os.environ.get("ROBOT_YOLO_MODEL", _DEFAULT_MODEL_NAME)).strip() or _DEFAULT_MODEL_NAME
+_CLASSES_FILE_RAW = str(os.environ.get("ROBOT_YOLOE_CLASSES_FILE", "models/yoloe_classes.txt")).strip() or "models/yoloe_classes.txt"
+_MOBILECLIP_FILE_RAW = str(os.environ.get("ROBOT_MOBILECLIP_MODEL", "models/mobileclip2_b.ts")).strip() or "models/mobileclip2_b.ts"
 
 
 def _normalize_model_name(name: str) -> str:
@@ -59,12 +65,50 @@ def _normalize_model_name(name: str) -> str:
 _MODEL_NAME = _normalize_model_name(_MODEL_NAME_RAW)
 _MODEL = None
 _MODEL_ERR: str = ""
+_MODEL_PATH: str = ""
+_MOBILECLIP_PATH: str = ""
+_PROMPT_CLASSES: list[str] = []
+_ALLOW_MOBILECLIP_DOWNLOAD = str(os.environ.get("ROBOT_ALLOW_MOBILECLIP_DOWNLOAD", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 _PERSON_CLASS = "person"
-_PHONE_CLASS = "cell phone"
+_PHONE_CLASS = "smartphone"
+
+_PERSON_LABEL_HINTS = {"person"}
+_PHONE_LABEL_HINTS = {
+    "smartphone",
+    "mobile phone",
+    "phone",
+    "cell phone",
+    "cellphone",
+    "iphone",
+    "android phone",
+    "device in hand",
+}
+_BADGE_LABEL_HINTS = {
+    "id badge",
+    "photo id badge",
+    "employee id badge",
+    "school id badge",
+    "name badge",
+    "lanyard id badge",
+    "uniform badge",
+    "badge on shirt",
+}
+_UNIFORM_WORDMARK_HINTS = {
+    "school wordmark on uniform",
+    "wordmark on uniform",
+    "uniform with school branding",
+    "school logo on uniform",
+    "school emblem on shirt",
+    "harmony public schools text logo",
+    "harmony logo on uniform",
+}
 
 _OBSTACLE_CLASSES = {
     "person",
+    "student",
+    "staff member",
+    "teacher",
     "bicycle",
     "bus",
     "car",
@@ -79,7 +123,18 @@ _OBSTACLE_CLASSES = {
     "potted plant",
     "dog",
     "cat",
+    "smartphone",
+    "mobile phone",
     "cell phone",
+    "backpack",
+    "book",
+    "laptop",
+    "tablet",
+    "chair",
+    "desk",
+    "door",
+    "trash can",
+    "debris",
 }
 
 
@@ -99,6 +154,200 @@ def _try_import_yolo():
         return YOLO
     except Exception:
         return None
+
+
+def _try_import_yoloe():
+    try:
+        from ultralytics import YOLOE  # type: ignore
+
+        return YOLOE
+    except Exception:
+        return None
+
+
+def _normalize_label(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in raw)
+    return " ".join(cleaned.split())
+
+
+def _label_matches(label: str, hints: set[str]) -> bool:
+    norm = _normalize_label(label)
+    if not norm:
+        return False
+    for hint in hints:
+        h = _normalize_label(hint)
+        if not h:
+            continue
+        if norm == h or h in norm or norm in h:
+            return True
+    return False
+
+
+def _is_person_label(label: str) -> bool:
+    return _label_matches(label, _PERSON_LABEL_HINTS)
+
+
+def _is_phone_label(label: str) -> bool:
+    return _label_matches(label, _PHONE_LABEL_HINTS)
+
+
+def _resolve_classes_file(raw_path: str) -> Path:
+    candidate = Path(str(raw_path or "").strip())
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+
+    options = [
+        _REPO_ROOT / candidate,
+        _MODELS_DIR / candidate,
+        _MODELS_DIR / candidate.name,
+    ]
+    for path in options:
+        if path.exists():
+            return path
+    return _MODELS_DIR / "yoloe_classes.txt"
+
+
+def _read_prompt_classes() -> list[str]:
+    path = _resolve_classes_file(_CLASSES_FILE_RAW)
+    if not path.exists():
+        return []
+
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        for part in parts:
+            if not part:
+                continue
+            key = _normalize_label(part)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(part)
+    return items
+
+
+def _resolve_model_path(name: str) -> str:
+    candidate = str(name or "").strip()
+    if not candidate:
+        candidate = _DEFAULT_MODEL_NAME
+
+    raw = Path(candidate)
+    if raw.is_absolute() and raw.exists():
+        return str(raw)
+
+    options = [
+        _MODELS_DIR / raw,
+        _REPO_ROOT / raw,
+        _MODELS_DIR / raw.name,
+    ]
+    for path in options:
+        if path.exists():
+            return str(path)
+    return candidate
+
+
+def _resolve_mobileclip_path(name: str) -> str:
+    candidate = str(name or "").strip()
+    if not candidate:
+        candidate = "mobileclip2_b.ts"
+
+    default_path = _MODELS_DIR / "mobileclip2_b.ts"
+    if default_path.exists():
+        return str(default_path)
+
+    raw = Path(candidate)
+    if raw.is_absolute() and raw.exists():
+        return str(raw)
+
+    options = [
+        _MODELS_DIR / raw,
+        _REPO_ROOT / raw,
+        _MODELS_DIR / raw.name,
+    ]
+    for path in options:
+        if path.exists():
+            return str(path)
+    return ""
+
+
+def _apply_text_classes(model, classes: list[str], mobileclip_path: str) -> bool:
+    if not classes or not hasattr(model, "set_classes"):
+        return True
+
+    clip_path = str(mobileclip_path or "").strip()
+    applied = False
+    if clip_path and Path(clip_path).exists():
+        clip_path_local = str(Path(clip_path).resolve()).replace("\\", "/")
+        try:
+            sig = inspect.signature(model.set_classes)
+            params = set(sig.parameters.keys())
+        except Exception:
+            params = set()
+
+        if "clip_model" in params:
+            try:
+                model.set_classes(classes, clip_model=clip_path_local)
+                applied = True
+            except Exception:
+                applied = False
+        if applied:
+            return True
+
+        if "model" in params:
+            try:
+                model.set_classes(classes, model=clip_path_local)
+                applied = True
+            except Exception:
+                applied = False
+        if applied:
+            return True
+
+        # Signature inspection can be unreliable on wrapped callables;
+        # try a few explicit forms used across ultralytics versions.
+        for call in (
+            lambda: model.set_classes(classes, clip_model=clip_path_local),
+            lambda: model.set_classes(classes, model=clip_path_local),
+            lambda: model.set_classes(classes, clip_path_local),
+            lambda: model.set_classes(classes, Path(clip_path_local)),
+        ):
+            try:
+                call()
+                applied = True
+                break
+            except Exception:
+                continue
+        if applied:
+            return True
+
+        try:
+            # Some ultralytics versions accept clip path as second positional arg.
+            model.set_classes(classes, clip_path_local)
+            applied = True
+        except Exception:
+            pass
+        if applied:
+            return True
+
+        try:
+            # Last local attempt: let backend resolve clip internally.
+            model.set_classes(classes)
+            return True
+        except Exception:
+            pass
+
+    # Avoid implicit download behavior unless explicitly allowed.
+    if _ALLOW_MOBILECLIP_DOWNLOAD:
+        try:
+            model.set_classes(classes)
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def _resolve_label(cls_index: int, names: Any) -> str:
@@ -122,28 +371,64 @@ def _download_to(path: Path, url: str) -> None:
 
 
 def _load_model():
-    global _MODEL, _MODEL_ERR
+    global _MODEL, _MODEL_ERR, _MODEL_PATH, _MOBILECLIP_PATH, _PROMPT_CLASSES
     if _MODEL is not None:
         return _MODEL
     if _MODEL_ERR:
         return None
 
+    model_path = _resolve_model_path(_MODEL_NAME)
+    _MODEL_PATH = model_path
+    _MOBILECLIP_PATH = _resolve_mobileclip_path(_MOBILECLIP_FILE_RAW)
+    _PROMPT_CLASSES = _read_prompt_classes()
+
+    YOLOE = _try_import_yoloe()
     YOLO = _try_import_yolo()
-    if YOLO is None:
+    if YOLO is None and YOLOE is None:
         _MODEL_ERR = "ultralytics unavailable"
         return None
 
     try:
-        _MODEL = YOLO(_MODEL_NAME)
+        if YOLOE is not None:
+            _MODEL = YOLOE(model_path)
+        else:
+            _MODEL = YOLO(model_path)
+
+        text_ok = False
+        try:
+            text_ok = _apply_text_classes(_MODEL, _PROMPT_CLASSES, _MOBILECLIP_PATH)
+        except Exception:
+            text_ok = False
+
+        if not text_ok and YOLO is not None:
+            # Fall back to base detector mode so detections remain available.
+            try:
+                _MODEL = YOLO(model_path)
+                _MODEL_ERR = ""
+            except Exception:
+                pass
+        else:
+            _MODEL_ERR = ""
         return _MODEL
     except Exception as exc:
-        # Fall back to a known-good default in case env var contains an
-        # unsupported alias/name. Keep the first error for diagnostics.
-        first_err = str(exc)
+        first_err = f"{model_path}: {exc}"
         try:
-            if _MODEL_NAME != "yolo11m.pt":
-                _MODEL = YOLO("yolo11m.pt")
-                _MODEL_ERR = ""
+            fallback_path = _resolve_model_path(_DEFAULT_MODEL_NAME)
+            if fallback_path != model_path and (YOLOE is not None or YOLO is not None):
+                if YOLOE is not None:
+                    _MODEL = YOLOE(fallback_path)
+                else:
+                    _MODEL = YOLO(fallback_path)
+                try:
+                    text_ok = _apply_text_classes(_MODEL, _PROMPT_CLASSES, _MOBILECLIP_PATH)
+                    if not text_ok and YOLO is not None:
+                        _MODEL = YOLO(fallback_path)
+                        _MODEL_ERR = ""
+                    else:
+                        _MODEL_ERR = ""
+                except Exception:
+                    _MODEL_ERR = ""
+                _MODEL_PATH = fallback_path
                 return _MODEL
         except Exception as fallback_exc:
             _MODEL_ERR = f"{first_err}; fallback failed: {fallback_exc}"
@@ -167,7 +452,7 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
 
     try:
         height, width = frame.shape[:2]
-        conf_thr = max(0.36, min(0.9, float(os.environ.get("ROBOT_YOLO_CONF", "0.40"))))
+        conf_thr = max(0.05, min(0.9, float(os.environ.get("ROBOT_YOLO_CONF", "0.25"))))
         img_size = max(320, min(1280, int(os.environ.get("ROBOT_YOLO_IMGSZ", "640"))))
 
         results = model.predict(source=frame, conf=conf_thr, imgsz=img_size, verbose=False)
@@ -185,6 +470,7 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
         best = None
         best_score = -1.0
         min_area_ratio = max(0.0005, min(0.5, float(os.environ.get("ROBOT_OD_MIN_AREA", "0.005"))))
+        close_area_ratio = max(min_area_ratio, min(0.9, float(os.environ.get("ROBOT_OD_CLOSE_AREA", "0.06"))))
 
         # Extract arrays from Ultralytics Boxes object in a version-tolerant way.
         try:
@@ -229,7 +515,7 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
             )
             detections.append(det)
 
-            if label not in _OBSTACLE_CLASSES:
+            if _normalize_label(label) not in _OBSTACLE_CLASSES:
                 continue
 
             bw = max(0, x2 - x1)
@@ -245,6 +531,18 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
 
         if best is None:
             return FrameAnalysis(detections=detections, obstacle="clear", throttle=0.9, steer=0.0, label="none", confidence=0.0, error="")
+
+        best_area_ratio = float(max(0, (best.x2 - best.x1) * (best.y2 - best.y1))) / float(max(1, width * height))
+        if best_area_ratio < close_area_ratio:
+            return FrameAnalysis(
+                detections=detections,
+                obstacle="clear",
+                throttle=0.9,
+                steer=0.0,
+                label=str(best.label),
+                confidence=float(best.confidence),
+                error="",
+            )
 
         cx = (best.x1 + best.x2) * 0.5
         nx = cx / float(max(1, width))
@@ -270,6 +568,14 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
 
 def get_model_error() -> str:
     return str(_MODEL_ERR)
+
+
+def get_model_path() -> str:
+    return str(_MODEL_PATH or _resolve_model_path(_MODEL_NAME))
+
+
+def get_prompt_classes() -> list[str]:
+    return list(_PROMPT_CLASSES or _read_prompt_classes())
 
 
 def _float_value(value: Any, default: float = 0.0) -> float:
@@ -334,12 +640,11 @@ def draw_detections(frame, detections: Sequence[Detection]):
     annotated = frame.copy()
 
     def color_for(label: str) -> tuple[int, int, int]:
-        low = str(label).lower()
-        if low == _PERSON_CLASS:
+        if _is_person_label(label):
             return (255, 160, 0)
-        if low == _PHONE_CLASS:
+        if _is_phone_label(label):
             return (0, 215, 255)
-        if low in _OBSTACLE_CLASSES:
+        if _normalize_label(label) in _OBSTACLE_CLASSES:
             return (0, 0, 255)
         return (0, 200, 0)
 
@@ -369,8 +674,8 @@ def draw_detections(frame, detections: Sequence[Detection]):
 
 
 def phone_holder_crop_from_detections(frame, detections: Sequence[Detection]):
-    phone_boxes = [det for det in detections if str(det.label).lower() == _PHONE_CLASS]
-    person_boxes = [det for det in detections if str(det.label).lower() == _PERSON_CLASS]
+    phone_boxes = [det for det in detections if _is_phone_label(str(det.label))]
+    person_boxes = [det for det in detections if _is_person_label(str(det.label))]
 
     if not phone_boxes or not person_boxes:
         return None
@@ -410,6 +715,79 @@ def phone_holder_crop_from_detections(frame, detections: Sequence[Detection]):
         return None
 
     return frame[top:bottom, left:right].copy()
+
+
+def _person_area_ratio(person: Detection, frame_shape) -> float:
+    h, w = frame_shape[:2]
+    if w <= 0 or h <= 0:
+        return 0.0
+    return float(_box_area(person)) / float(w * h)
+
+
+def _is_detection_on_person(target: Detection, person: Detection) -> bool:
+    tx, ty = _box_center(target)
+    if _point_in_box(tx, ty, person):
+        return True
+    overlap = _intersection_area(target, person)
+    target_area = max(1, _box_area(target))
+    return (float(overlap) / float(target_area)) >= 0.25
+
+
+def _person_crop_with_padding(frame, person: Detection):
+    frame_h, frame_w = frame.shape[:2]
+    pad_x = int(max(10, (person.x2 - person.x1) * 0.12))
+    pad_y = int(max(10, (person.y2 - person.y1) * 0.12))
+    left = max(0, person.x1 - pad_x)
+    top = max(0, person.y1 - pad_y)
+    right = min(frame_w, person.x2 + pad_x)
+    bottom = min(frame_h, person.y2 + pad_y)
+    if right <= left or bottom <= top:
+        return None
+    return frame[top:bottom, left:right].copy()
+
+
+def detect_uniform_compliance_from_detections(frame, detections: Sequence[Detection]) -> dict[str, Any]:
+    persons = [det for det in detections if _is_person_label(str(det.label))]
+    medium_thr = max(0.02, min(0.45, float(os.environ.get("ROBOT_PERSON_MEDIUM_AREA", "0.08"))))
+    close_thr = max(medium_thr, min(0.75, float(os.environ.get("ROBOT_PERSON_CLOSE_AREA", "0.18"))))
+
+    missing_badge_person: Optional[Detection] = None
+    missing_wordmark_person: Optional[Detection] = None
+    has_medium_person = False
+    has_close_person = False
+
+    for person in persons:
+        area_ratio = _person_area_ratio(person, frame.shape)
+        if area_ratio >= medium_thr:
+            has_medium_person = True
+            has_badge = any(
+                _label_matches(str(det.label), _BADGE_LABEL_HINTS) and _is_detection_on_person(det, person)
+                for det in detections
+                if det is not person
+            )
+            if not has_badge:
+                if missing_badge_person is None or _box_area(person) > _box_area(missing_badge_person):
+                    missing_badge_person = person
+
+        if area_ratio >= close_thr:
+            has_close_person = True
+            has_wordmark = any(
+                _label_matches(str(det.label), _UNIFORM_WORDMARK_HINTS) and _is_detection_on_person(det, person)
+                for det in detections
+                if det is not person
+            )
+            if not has_wordmark:
+                if missing_wordmark_person is None or _box_area(person) > _box_area(missing_wordmark_person):
+                    missing_wordmark_person = person
+
+    return {
+        "has_medium_person": has_medium_person,
+        "has_close_person": has_close_person,
+        "missing_badge": missing_badge_person is not None,
+        "missing_wordmark": missing_wordmark_person is not None,
+        "missing_badge_crop": (_person_crop_with_padding(frame, missing_badge_person) if missing_badge_person is not None else None),
+        "missing_wordmark_crop": (_person_crop_with_padding(frame, missing_wordmark_person) if missing_wordmark_person is not None else None),
+    }
 
 
 def detect_obstacle_from_bgr(frame) -> tuple[ObstacleState, str, float]:

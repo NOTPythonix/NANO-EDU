@@ -1,0 +1,110 @@
+# Put classes here (one per line OR comma-separated on a line)
+# This file is read automatically by server/inference.py for custom text prompting
+person
+smartphone
+photo id badge
+school wordmark on uniform
+
+# random objects
+backpack
+notebook
+textbook
+binder
+loose papers
+crumpled paper
+pencil
+pen
+mechanical pencil
+highlighter
+eraser
+ruler
+calculator
+laptop
+laptop charger
+tablet
+phone charger
+earbuds
+headphones
+water bottle
+lunch box
+snack wrapper
+chip bag
+granola bar wrapper
+juice box
+milk carton
+plastic bottle
+binder clip
+paper clip pile
+sticky notes
+folder
+gym bag
+hoodie
+jacket
+scarf
+hat
+gloves
+umbrella
+sports ball
+basketball
+soccer ball
+tennis ball
+jump rope
+clipboard
+keychain
+keys
+flash drive
+USB cable
+power bank
+tissue
+used tissue
+hand sanitizer bottle
+mask
+broken pencil pieces
+chalk
+dry erase marker
+whiteboard eraser
+poster board scrap
+project materials
+craft supplies
+glue stick
+tape roll
+scissors
+string
+rubber bands
+coin
+wall
+loose change
+library book
+spiral notebook
+composition notebook
+exam paper
+quiz paper
+binder divider
+locker lock
+comb
+hair tie
+hair clip
+makeup pouch
+lip balm
+mirror compact
+shoe
+shoelace
+sock
+belt
+trash bag
+recycling bin item
+food tray
+plastic fork
+plastic spoon
+napkin
+paper plate
+cardboard box
+delivery package
+cleaning mop head
+wet floor sign
+extension cord
+power strip
+chair
+chair leg
+table
+table leg

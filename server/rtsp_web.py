@@ -11,7 +11,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
 
-from server.inference import analyze_frame_from_bgr, draw_detections, get_model_error, phone_holder_crop_from_detections
+from server.inference import (
+    analyze_frame_from_bgr,
+    detect_uniform_compliance_from_detections,
+    draw_detections,
+    get_model_error,
+    get_model_path,
+    get_prompt_classes,
+    phone_holder_crop_from_detections,
+)
 
 
 def _load_env_file() -> None:
@@ -47,6 +55,20 @@ PHONE_ALERT_SMTP_PASSWORD = os.environ.get("ROBOT_ALERT_SMTP_PASSWORD", "")
 PHONE_ALERT_FROM_EMAIL = os.environ.get("ROBOT_ALERT_FROM_EMAIL", PHONE_ALERT_SMTP_USERNAME or PHONE_ALERT_TO_EMAIL)
 PHONE_ALERT_USE_TLS = str(os.environ.get("ROBOT_ALERT_SMTP_TLS", "1")).strip().lower() not in ("0", "false", "no")
 PHONE_ALERT_COOLDOWN_S = max(5.0, float(os.environ.get("ROBOT_PHONE_ALERT_COOLDOWN_S", "60")))
+BADGE_ALERT_COOLDOWN_S = max(5.0, float(os.environ.get("ROBOT_BADGE_ALERT_COOLDOWN_S", "90")))
+UNIFORM_ALERT_COOLDOWN_S = max(5.0, float(os.environ.get("ROBOT_UNIFORM_ALERT_COOLDOWN_S", "90")))
+MISSING_COMPLIANCE_HOLD_S = 5.0
+
+
+def _label_seen(detections, hints: tuple[str, ...]) -> bool:
+    for det in detections or []:
+        label = str(getattr(det, "label", "") or "").strip().lower()
+        if not label:
+            continue
+        for hint in hints:
+            if hint in label:
+                return True
+    return False
 
 
 def _try_import_cv2():
@@ -61,10 +83,11 @@ def _try_import_cv2():
 class RtspWebUi:
     """Server-side web UI that proxies client stream URLs into browser-viewable MJPEG."""
 
-    def __init__(self, *, host: str, port: int, get_rtsp_url: Callable[[], str]):
+    def __init__(self, *, host: str, port: int, get_rtsp_url: Callable[[], str], alert_emails_enabled: bool = True):
         self._host = str(host)
         self._port = int(port)
         self._get_rtsp_url = get_rtsp_url
+        self._alert_emails_enabled = bool(alert_emails_enabled)
 
         self._stop = threading.Event()
         self._http: Optional[ThreadingHTTPServer] = None
@@ -77,6 +100,8 @@ class RtspWebUi:
         self._last_error: str = ""
         self._active_rtsp_url: str = ""
         self._phone_alert_last_sent_ts: float = 0.0
+        self._badge_alert_last_sent_ts: float = 0.0
+        self._uniform_alert_last_sent_ts: float = 0.0
         self._latest_frame_bgr = None
         self._latest_frame_seq: int = 0
         self._last_analysed_seq: int = 0
@@ -84,9 +109,20 @@ class RtspWebUi:
         self._latest_analysis: Optional[dict] = None
         self._latest_analysis_ts: Optional[float] = None
         self._analysis_duration_samples: deque[float] = deque(maxlen=5)
-        self._analysis_interval_s: float = 1.0 / 30.0
+        self._analysis_target_fps: float = max(5.0, min(60.0, float(os.environ.get("ROBOT_ANALYSIS_TARGET_FPS", "30"))))
+        self._analysis_min_interval_s: float = 1.0 / self._analysis_target_fps
+        self._analysis_interval_s: float = self._analysis_min_interval_s
+        self._analysis_warmup_remaining: int = max(0, int(os.environ.get("ROBOT_ANALYSIS_WARMUP_FRAMES", "20")))
+        self._analysis_ema_alpha: float = max(0.05, min(0.90, float(os.environ.get("ROBOT_ANALYSIS_ADAPT_ALPHA", "0.35"))))
+        self._analysis_ema_duration: Optional[float] = None
         self._phone_last_seen_ts: Optional[float] = None
+        self._badge_last_seen_ts: Optional[float] = None
+        self._wordmark_last_seen_ts: Optional[float] = None
         self._phone_last_triggered_ts: Optional[float] = None
+        self._badge_last_triggered_ts: Optional[float] = None
+        self._uniform_last_triggered_ts: Optional[float] = None
+        self._badge_missing_since_ts: Optional[float] = None
+        self._uniform_missing_since_ts: Optional[float] = None
 
     @property
     def bound_url(self) -> str:
@@ -148,12 +184,43 @@ class RtspWebUi:
                 return None, int(self._latest_frame_seq)
             return self._latest_frame_bgr.copy(), int(self._latest_frame_seq)
 
-    def _set_analysis(self, *, analysis, seq: int, error: str = "", phone_seen: bool = False, phone_triggered: bool = False, phone_triggered_ts: Optional[float] = None) -> None:
+    def _set_analysis(
+        self,
+        *,
+        analysis,
+        seq: int,
+        error: str = "",
+        phone_seen: bool = False,
+        phone_triggered: bool = False,
+        phone_triggered_ts: Optional[float] = None,
+        badge_alert_triggered: bool = False,
+        badge_alert_triggered_ts: Optional[float] = None,
+        uniform_alert_triggered: bool = False,
+        uniform_alert_triggered_ts: Optional[float] = None,
+        badge_seen: bool = False,
+        wordmark_seen: bool = False,
+        has_medium_person: bool = False,
+        has_close_person: bool = False,
+        missing_badge: bool = False,
+        missing_wordmark: bool = False,
+        badge_missing_for_s: float = 0.0,
+        uniform_missing_for_s: float = 0.0,
+        badge_hold_met: bool = False,
+        uniform_hold_met: bool = False,
+    ) -> None:
         now = time.time()
         if phone_seen:
             self._phone_last_seen_ts = now
+        if badge_seen:
+            self._badge_last_seen_ts = now
+        if wordmark_seen:
+            self._wordmark_last_seen_ts = now
         if phone_triggered:
             self._phone_last_triggered_ts = float(phone_triggered_ts or now)
+        if badge_alert_triggered:
+            self._badge_last_triggered_ts = float(badge_alert_triggered_ts or now)
+        if uniform_alert_triggered:
+            self._uniform_last_triggered_ts = float(uniform_alert_triggered_ts or now)
 
         detections = list(getattr(analysis, "detections", []) or [])
         detections_sorted = sorted(detections, key=lambda det: (-float(getattr(det, "confidence", 0.0) or 0.0), str(getattr(det, "label", ""))))
@@ -193,6 +260,24 @@ class RtspWebUi:
                 "phone_detected_ts": self._phone_last_seen_ts,
                 "phone_alert_triggered": bool(phone_triggered),
                 "phone_alert_triggered_ts": self._phone_last_triggered_ts,
+                "badge_detected": bool(badge_seen),
+                "badge_detected_ts": self._badge_last_seen_ts,
+                "wordmark_detected": bool(wordmark_seen),
+                "wordmark_detected_ts": self._wordmark_last_seen_ts,
+                "person_medium_close": bool(has_medium_person),
+                "person_close": bool(has_close_person),
+                "missing_id_badge": bool(missing_badge),
+                "missing_uniform_wordmark": bool(missing_wordmark),
+                "missing_badge_for_s": round(max(0.0, float(badge_missing_for_s or 0.0)), 2),
+                "missing_wordmark_for_s": round(max(0.0, float(uniform_missing_for_s or 0.0)), 2),
+                "badge_hold_met": bool(badge_hold_met),
+                "uniform_hold_met": bool(uniform_hold_met),
+                "badge_alert_triggered": bool(badge_alert_triggered),
+                "badge_alert_triggered_ts": self._badge_last_triggered_ts,
+                "uniform_alert_triggered": bool(uniform_alert_triggered),
+                "uniform_alert_triggered_ts": self._uniform_last_triggered_ts,
+                "model_path": get_model_path(),
+                "prompt_class_count": len(get_prompt_classes()),
             }
             self._latest_analysis_ts = now
             self._last_analysed_seq = int(seq)
@@ -208,10 +293,26 @@ class RtspWebUi:
                 data["phone_detected_age_s"] = round(max(0.0, time.time() - self._phone_last_seen_ts), 2)
             else:
                 data["phone_detected_age_s"] = None
+            if self._badge_last_seen_ts is not None:
+                data["badge_detected_age_s"] = round(max(0.0, time.time() - self._badge_last_seen_ts), 2)
+            else:
+                data["badge_detected_age_s"] = None
+            if self._wordmark_last_seen_ts is not None:
+                data["wordmark_detected_age_s"] = round(max(0.0, time.time() - self._wordmark_last_seen_ts), 2)
+            else:
+                data["wordmark_detected_age_s"] = None
             if self._phone_last_triggered_ts is not None:
                 data["phone_alert_age_s"] = round(max(0.0, time.time() - self._phone_last_triggered_ts), 2)
             else:
                 data["phone_alert_age_s"] = None
+            if self._badge_last_triggered_ts is not None:
+                data["badge_alert_age_s"] = round(max(0.0, time.time() - self._badge_last_triggered_ts), 2)
+            else:
+                data["badge_alert_age_s"] = None
+            if self._uniform_last_triggered_ts is not None:
+                data["uniform_alert_age_s"] = round(max(0.0, time.time() - self._uniform_last_triggered_ts), 2)
+            else:
+                data["uniform_alert_age_s"] = None
             data["model_error"] = get_model_error()
             return data
 
@@ -229,25 +330,99 @@ class RtspWebUi:
                 continue
 
             analysis = analyze_frame_from_bgr(frame)
+            detections = list(getattr(analysis, "detections", []) or [])
             phone_crop = phone_holder_crop_from_detections(frame, getattr(analysis, "detections", []))
+            compliance = detect_uniform_compliance_from_detections(frame, getattr(analysis, "detections", []))
             phone_seen = phone_crop is not None
+            badge_seen = _label_seen(
+                detections,
+                ("badge", "id badge", "name badge", "lanyard"),
+            )
+            wordmark_seen = _label_seen(
+                detections,
+                ("wordmark", "school logo", "school emblem", "harmony logo", "harmony public schools text logo", "logo"),
+            )
             phone_triggered = False
+            badge_triggered = False
+            uniform_triggered = False
+            now = time.time()
 
-            if phone_seen and self._should_send_phone_alert(time.time()):
+            missing_badge_now = bool(compliance.get("missing_badge", False)) and bool(compliance.get("has_medium_person", False))
+            if missing_badge_now:
+                if self._badge_missing_since_ts is None:
+                    self._badge_missing_since_ts = now
+                badge_missing_for_s = max(0.0, now - self._badge_missing_since_ts)
+            else:
+                self._badge_missing_since_ts = None
+                badge_missing_for_s = 0.0
+            badge_hold_met = missing_badge_now and (badge_missing_for_s >= MISSING_COMPLIANCE_HOLD_S)
+
+            missing_wordmark_now = bool(compliance.get("missing_wordmark", False)) and bool(compliance.get("has_close_person", False))
+            if missing_wordmark_now:
+                if self._uniform_missing_since_ts is None:
+                    self._uniform_missing_since_ts = now
+                uniform_missing_for_s = max(0.0, now - self._uniform_missing_since_ts)
+            else:
+                self._uniform_missing_since_ts = None
+                uniform_missing_for_s = 0.0
+            uniform_hold_met = missing_wordmark_now and (uniform_missing_for_s >= MISSING_COMPLIANCE_HOLD_S)
+
+            if self._alert_emails_enabled and phone_seen and self._should_send_phone_alert(now):
                 phone_triggered = True
-                self._mark_phone_alert_sent(time.time())
+                self._mark_phone_alert_sent(now)
                 ok_phone, phone_enc = cv2.imencode(".jpg", phone_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                 if ok_phone and phone_enc is not None:
                     phone_jpeg = bytes(phone_enc.tobytes())
 
                     def _send_async(payload: bytes) -> None:
-                        self._send_phone_alert_email(
+                        self._send_alert_email(
                             payload,
                             subject="Phone detected on robot camera",
                             body="A phone was detected in the robot camera feed. An image is attached.",
+                            attachment_name="phone-alert.jpg",
                         )
 
                     threading.Thread(target=_send_async, args=(phone_jpeg,), name="PhoneAlertEmail", daemon=True).start()
+
+            if self._alert_emails_enabled and badge_hold_met and self._should_send_badge_alert(now):
+                badge_triggered = True
+                self._mark_badge_alert_sent(now)
+                badge_crop = compliance.get("missing_badge_crop")
+                if badge_crop is None:
+                    badge_crop = frame
+                ok_badge, badge_enc = cv2.imencode(".jpg", badge_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ok_badge and badge_enc is not None:
+                    badge_jpeg = bytes(badge_enc.tobytes())
+
+                    def _send_badge_async(payload: bytes) -> None:
+                        self._send_alert_email(
+                            payload,
+                            subject="ID badge missing (medium-close person)",
+                            body="A medium-close person was detected without an ID badge. An image is attached.",
+                            attachment_name="missing-badge.jpg",
+                        )
+
+                    threading.Thread(target=_send_badge_async, args=(badge_jpeg,), name="BadgeAlertEmail", daemon=True).start()
+
+            if self._alert_emails_enabled and uniform_hold_met and self._should_send_uniform_alert(now):
+                uniform_triggered = True
+                self._mark_uniform_alert_sent(now)
+                uniform_crop = compliance.get("missing_wordmark_crop")
+                if uniform_crop is None:
+                    uniform_crop = frame
+                ok_uni, uni_enc = cv2.imencode(".jpg", uniform_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ok_uni and uni_enc is not None:
+                    uniform_jpeg = bytes(uni_enc.tobytes())
+
+                    def _send_uniform_async(payload: bytes) -> None:
+                        self._send_alert_email(
+                            payload,
+                            subject="Uniform wordmark missing (close person)",
+                            body='A close person was detected without the expected "school wordmark on uniform". An image is attached.',
+                            attachment_name="missing-wordmark.jpg",
+                        )
+
+                    threading.Thread(target=_send_uniform_async, args=(uniform_jpeg,), name="UniformAlertEmail", daemon=True).start()
 
             self._set_analysis(
                 analysis=analysis,
@@ -255,12 +430,42 @@ class RtspWebUi:
                 phone_seen=phone_seen,
                 phone_triggered=phone_triggered,
                 phone_triggered_ts=time.time() if phone_triggered else None,
+                badge_alert_triggered=badge_triggered,
+                badge_alert_triggered_ts=time.time() if badge_triggered else None,
+                uniform_alert_triggered=uniform_triggered,
+                uniform_alert_triggered_ts=time.time() if uniform_triggered else None,
+                badge_seen=badge_seen,
+                wordmark_seen=wordmark_seen,
+                has_medium_person=bool(compliance.get("has_medium_person", False)),
+                has_close_person=bool(compliance.get("has_close_person", False)),
+                missing_badge=bool(compliance.get("missing_badge", False)),
+                missing_wordmark=bool(compliance.get("missing_wordmark", False)),
+                badge_missing_for_s=badge_missing_for_s,
+                uniform_missing_for_s=uniform_missing_for_s,
+                badge_hold_met=badge_hold_met,
+                uniform_hold_met=uniform_hold_met,
             )
             analysis_duration = max(0.0, time.perf_counter() - loop_started)
-            self._analysis_duration_samples.append(analysis_duration)
-            avg_duration = sum(self._analysis_duration_samples) / len(self._analysis_duration_samples)
-            target_interval = max(1.0 / 30.0, avg_duration)
-            self._analysis_interval_s = target_interval
+            if self._analysis_warmup_remaining > 0:
+                # Ignore startup jitters/compilation overhead when learning pacing.
+                self._analysis_warmup_remaining -= 1
+                target_interval = self._analysis_min_interval_s
+                self._analysis_interval_s = target_interval
+            else:
+                self._analysis_duration_samples.append(analysis_duration)
+                if self._analysis_ema_duration is None:
+                    self._analysis_ema_duration = analysis_duration
+                else:
+                    a = self._analysis_ema_alpha
+                    self._analysis_ema_duration = (1.0 - a) * self._analysis_ema_duration + a * analysis_duration
+
+                # Use EMA for stability, but cap with recent minimum to recover quickly
+                # after warm-up spikes.
+                ema_duration = float(self._analysis_ema_duration or analysis_duration)
+                recent_min = min(self._analysis_duration_samples) if self._analysis_duration_samples else analysis_duration
+                learned_duration = min(ema_duration, recent_min * 1.25)
+                target_interval = max(self._analysis_min_interval_s, learned_duration)
+                self._analysis_interval_s = target_interval
 
             sleep_for = max(0.0, target_interval - analysis_duration)
             if sleep_for > 0:
@@ -270,11 +475,27 @@ class RtspWebUi:
         with self._lock:
             return (now - self._phone_alert_last_sent_ts) >= PHONE_ALERT_COOLDOWN_S
 
+    def _should_send_badge_alert(self, now: float) -> bool:
+        with self._lock:
+            return (now - self._badge_alert_last_sent_ts) >= BADGE_ALERT_COOLDOWN_S
+
+    def _should_send_uniform_alert(self, now: float) -> bool:
+        with self._lock:
+            return (now - self._uniform_alert_last_sent_ts) >= UNIFORM_ALERT_COOLDOWN_S
+
     def _mark_phone_alert_sent(self, now: float) -> None:
         with self._lock:
             self._phone_alert_last_sent_ts = float(now)
 
-    def _send_phone_alert_email(self, image_bytes: bytes, *, subject: str, body: str) -> None:
+    def _mark_badge_alert_sent(self, now: float) -> None:
+        with self._lock:
+            self._badge_alert_last_sent_ts = float(now)
+
+    def _mark_uniform_alert_sent(self, now: float) -> None:
+        with self._lock:
+            self._uniform_alert_last_sent_ts = float(now)
+
+    def _send_alert_email(self, image_bytes: bytes, *, subject: str, body: str, attachment_name: str) -> None:
         if not PHONE_ALERT_TO_EMAIL or PHONE_ALERT_TO_EMAIL.startswith("replace-this-with-a-recipient"):
             return
         if not PHONE_ALERT_SMTP_USERNAME or not PHONE_ALERT_SMTP_PASSWORD:
@@ -286,7 +507,7 @@ class RtspWebUi:
         msg["From"] = PHONE_ALERT_FROM_EMAIL
         msg["To"] = PHONE_ALERT_TO_EMAIL
         msg.set_content(body)
-        msg.add_attachment(image_bytes, maintype="image", subtype="jpeg", filename="phone-alert.jpg")
+        msg.add_attachment(image_bytes, maintype="image", subtype="jpeg", filename=str(attachment_name or "alert.jpg"))
 
         try:
             if PHONE_ALERT_SMTP_PORT == 465:

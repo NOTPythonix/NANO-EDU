@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 Command = Tuple[str, Optional[int]]
 
 
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "vosk-model-small-en-us-0.15"
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "vosk-model-small-en-us-0.15"
 
 
 def _tail_words(text: str, limit: int = 7) -> str:
