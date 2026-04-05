@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ if __package__ is None or __package__ == "":
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if ROOT_DIR not in sys.path:
         sys.path.insert(0, ROOT_DIR)
+else:
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from server.net_server import JsonLineRobotServer
 from server.rtsp_web import RtspWebUi
@@ -700,6 +703,14 @@ def run_remote_motor_test(console: Console, srv: JsonLineRobotServer, *, peak: f
 
 
 def main() -> int:
+    # Band-aid launcher: if started outside /models, re-run from /models.
+    cwd_name = os.path.basename(os.path.abspath(os.getcwd())).lower()
+    if cwd_name != "models" and os.environ.get("ROBOT_TUI_SERVER_LAUNCHED_FROM_MODELS", "0") != "1":
+        launcher = os.path.join(ROOT_DIR, "server", "launch_from_models.py")
+        if os.path.isfile(launcher):
+            result = subprocess.run([sys.executable, launcher, os.path.abspath(__file__), *sys.argv[1:]])
+            return int(result.returncode)
+
     console = Console()
     _header(console)
 
