@@ -164,22 +164,39 @@ def _ellipsize(s: str, max_len: int) -> str:
     return s[: max_len - 3] + "..."
 
 
-def _pi_temp_label() -> str:
+def _pi_stats_label() -> str:
     # Linux/Raspberry Pi thermal zone in millidegrees Celsius.
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r", encoding="utf-8") as f:
             raw = f.read().strip()
         temp_c = float(raw) / 1000.0
     except Exception:
+        temp_c = None
+
+    # CPU frequency in kHz on Raspberry Pi/Linux.
+    try:
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        ghz = float(raw) / 1_000_000.0
+    except Exception:
+        ghz = None
+
+    if temp_c is None and ghz is None:
         return "[dim]N/A[/]"
 
-    if temp_c >= 75.0:
-        color = "red"
-    elif temp_c >= 65.0:
-        color = "yellow"
+    if temp_c is None:
+        temp_part = "[dim]Temp N/A[/]"
     else:
-        color = "green"
-    return f"[{color}]{temp_c:.1f} C[/]"
+        if temp_c >= 75.0:
+            color = "red"
+        elif temp_c >= 65.0:
+            color = "yellow"
+        else:
+            color = "green"
+        temp_part = f"[{color}]{temp_c:.1f} C[/]"
+
+    ghz_part = f"[cyan]{ghz:.3f} GHz[/]" if ghz is not None else "[dim]GHz N/A[/]"
+    return f"{temp_part}  {ghz_part}"
 
 
 def run_motor_test_tui(*, dry_run: bool, peak: float, cycles_per_motor: int) -> int:
@@ -550,7 +567,7 @@ def run_live_dashboard_tui(
     def status_panel() -> Panel:
         runtime_s = int(time.time() - start_t)
         cap_pct = int(round(state.max_speed_setting * 100))
-        pi_temp = _pi_temp_label()
+        pi_stats = _pi_stats_label()
         try:
             out = max(abs(m.last_speed) for m in motor_map.values()) if motor_map else 0.0
         except Exception:
@@ -570,7 +587,7 @@ def run_live_dashboard_tui(
             peer = _ellipsize(st.peer or (f"{net.host}:{net.port}" if net else "—"), 28)
 
         rows = [
-            ("Pi Temp", pi_temp),
+            ("Pi Stats", pi_stats),
             ("Run", "DRY" if dry_run else "REAL"),
             ("Network", net_state),
             ("Client IP", client_ip),
@@ -929,7 +946,7 @@ def run_live_dashboard_tui(
 
                 if link is not None and link.stats.connected and (now - last_telemetry_tx) >= 0.10:
                     try:
-                        pi_temp_now = _pi_temp_label()
+                        pi_stats_now = _pi_stats_label()
                         net_state = "[green]CONNECTED[/]" if link.stats.connected else "[red]DISCONNECTED[/]"
                         round_trip = f"{float(link.stats.rtt_ms):.1f} ms" if link.stats.rtt_ms is not None else "—"
                         receive_age = f"{int(now - link.stats.last_rx_ts)}s" if link.stats.last_rx_ts is not None else "—"
@@ -1012,7 +1029,7 @@ def run_live_dashboard_tui(
                                 },
                                 "ui_rows": {
                                     "status": [
-                                        {"k": "Pi Temp", "v": pi_temp_now},
+                                        {"k": "Pi Stats", "v": pi_stats_now},
                                         {"k": "Run", "v": ("DRY" if dry_run else "REAL")},
                                         {"k": "Network", "v": net_state},
                                         {"k": "Client IP", "v": str(client_ip or "—")},
