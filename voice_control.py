@@ -199,8 +199,8 @@ class VoiceController:
             if best >= 0:
                 candidates.append((best, cmd))
 
-        add_last(("forward", None), [r"\bmove forward\b", r"\bgo forward\b", r"\bturn forward\b", r"\bforward\b"])
-        add_last(("backward", None), [r"\bmove back\b", r"\bgo back\b", r"\bturn back\b", r"\bbackward\b", r"\bback\b"])
+        add_last(("forward", None), [r"\bmove forward\b", r"\bgo forward\b", r"\bturn forward\b", r"\bforward\b", r"\bforwards\b"])
+        add_last(("backward", None), [r"\bmove back\b", r"\bgo back\b", r"\bturn back\b", r"\bbackward\b", r"\bbackwards\b", r"\breverse\b", r"\bback\b"])
         add_last(("left", None), [r"\bturn left\b", r"\bgo left\b", r"\bleft\b"])
         add_last(("right", None), [r"\bturn right\b", r"\bgo right\b", r"\bright\b"])
         add_last(("stop", None), [r"\bstop\b", r"\bhalt\b"])
