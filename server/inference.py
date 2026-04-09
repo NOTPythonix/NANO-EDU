@@ -470,7 +470,8 @@ def analyze_frame_from_bgr(frame) -> FrameAnalysis:
         best = None
         best_score = -1.0
         min_area_ratio = max(0.0005, min(0.5, float(os.environ.get("ROBOT_OD_MIN_AREA", "0.005"))))
-        close_area_ratio = max(min_area_ratio, min(0.9, float(os.environ.get("ROBOT_OD_CLOSE_AREA", "0.06"))))
+        # Only react in autonomous mode when objects are close enough.
+        close_area_ratio = max(min_area_ratio, min(0.9, float(os.environ.get("ROBOT_OD_CLOSE_AREA", "0.18"))))
 
         # Extract arrays from Ultralytics Boxes object in a version-tolerant way.
         try:

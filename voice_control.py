@@ -263,10 +263,16 @@ class AudioStreamClient:
 
             def callback(indata, frames, time_info, status) -> None:
                 if status:
-                    self.last_error = f"audio status: {status}"
+                    # Input overflow is common under load on SBCs; keep streaming and
+                    # avoid latching a permanent error banner for a recoverable condition.
+                    overflow = bool(getattr(status, "input_overflow", False))
+                    if not overflow:
+                        self.last_error = f"audio status: {status}"
                 try:
                     self._audio_q.put_nowait(bytes(indata))
                     self._last_chunk_ts = time.time()
+                    if str(self.last_error).startswith("audio status:"):
+                        self.last_error = ""
                 except queue.Full:
                     # Keep freshest audio by dropping oldest chunk first.
                     try:
@@ -327,6 +333,7 @@ class ServerVoiceRecognizer:
         self._last_cmd: Optional[Command] = None
         self._last_ts: Optional[float] = None
         self._last_emitted_cmd: Optional[Command] = None
+        self._last_partial: str = ""
         self.last_error: str = ""
 
         try:
@@ -356,19 +363,15 @@ class ServerVoiceRecognizer:
         try:
             rec.AcceptWaveform(data)
 
-            # Prefer final result text when available, otherwise use partial.
-            final_txt = ""
             partial_txt = ""
-            try:
-                final_txt = str(json.loads(rec.Result()).get("text", "") or "").strip()
-            except Exception:
-                final_txt = ""
             try:
                 partial_txt = str(json.loads(rec.PartialResult()).get("partial", "") or "").strip()
             except Exception:
                 partial_txt = ""
+            if partial_txt:
+                self._last_partial = partial_txt
 
-            text = final_txt or partial_txt
+            text = partial_txt or self._last_partial
             if text:
                 with self._lock:
                     self._last_text = _tail_words(text)

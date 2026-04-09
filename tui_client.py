@@ -981,20 +981,22 @@ def run_live_dashboard_tui(
 
                 if audio_streamer and audio_streamer.available:
                     if link is not None and link.stats.connected:
-                        for chunk in audio_streamer.poll_chunks(max_chunks=3):
+                        chunks = audio_streamer.poll_chunks(max_chunks=6)
+                        if chunks:
+                            merged = b"".join(chunks)
                             try:
                                 link.send(
                                     {
                                         "type": "audio_chunk",
                                         "ts": now,
                                         "sample_rate": int(audio_streamer.sample_rate),
-                                        "pcm16_b64": base64.b64encode(chunk).decode("ascii"),
+                                        "pcm16_b64": base64.b64encode(merged).decode("ascii"),
                                     }
                                 )
                             except Exception:
                                 pass
                     else:
-                        _ = audio_streamer.poll_chunks(max_chunks=3)
+                        _ = audio_streamer.poll_chunks(max_chunks=6)
 
                 if link is not None and link.stats.connected and (now - last_telemetry_tx) >= 0.10:
                     try:

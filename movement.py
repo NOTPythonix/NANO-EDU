@@ -83,9 +83,9 @@ class Motor:
 @dataclass
 class DriveConfig:
     pwm_frequency_hz: int = 200
-    steer_gain: float = 0.70
+    steer_gain: float = 1.00
     allow_pivot_turn: bool = True
-    pivot_speed: float = 0.45
+    pivot_speed: float = 0.85
 
     max_fwd_speed: float = 1.0
     max_rev_speed: float = 1.0
