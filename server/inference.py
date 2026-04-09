@@ -639,6 +639,10 @@ def draw_detections(frame, detections: Sequence[Detection]):
         return frame
 
     annotated = frame.copy()
+    h, w = annotated.shape[:2]
+    line_th = max(2, int(min(w, h) / 240))
+    font_scale = max(0.55, min(1.1, float(min(w, h)) / 700.0))
+    text_th = max(1, line_th - 1)
 
     def color_for(label: str) -> tuple[int, int, int]:
         if _is_person_label(label):
@@ -651,25 +655,32 @@ def draw_detections(frame, detections: Sequence[Detection]):
 
     for det in detections:
         color = color_for(det.label)
-        cv2.rectangle(annotated, (det.x1, det.y1), (det.x2, det.y2), color, 2)
+        cv2.rectangle(annotated, (det.x1, det.y1), (det.x2, det.y2), color, line_th)
         label = f"{det.label} {det.confidence:.2f}"
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_th)
         text_x = det.x1
         text_y = max(0, det.y1 - 6)
         bg_y1 = max(0, text_y - th - baseline)
         bg_y2 = min(annotated.shape[0], text_y + baseline)
-        bg_x2 = min(annotated.shape[1], text_x + tw + 6)
+        bg_x2 = min(annotated.shape[1], text_x + tw + 10)
         cv2.rectangle(annotated, (text_x, bg_y1), (bg_x2, bg_y2), color, -1)
         cv2.putText(
             annotated,
             label,
-            (text_x + 3, max(th, text_y)),
+            (text_x + 4, max(th, text_y)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            font_scale,
             (0, 0, 0),
-            1,
+            text_th,
             cv2.LINE_AA,
         )
+
+    # Always show a small high-contrast HUD to make overlay presence obvious.
+    hud = f"detections: {len(detections)}"
+    (hw, hh), hbase = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(annotated, (8, 8), (16 + hw, 18 + hh + hbase), (0, 0, 0), -1)
+    cv2.rectangle(annotated, (8, 8), (16 + hw, 18 + hh + hbase), (70, 255, 70), 1)
+    cv2.putText(annotated, hud, (12, 12 + hh), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (70, 255, 70), 1, cv2.LINE_AA)
 
     return annotated
 
