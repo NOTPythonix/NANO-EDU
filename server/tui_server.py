@@ -401,12 +401,15 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
     last_obs: Optional[str] = None
     last_obs_tx = 0.0
     last_analysis_tx = 0.0
+    max_voice_chunks_per_tick = max(1, int(os.environ.get("ROBOT_VOICE_MAX_CHUNKS_PER_TICK", "2")))
+    max_voice_bytes = max(2048, int(os.environ.get("ROBOT_VOICE_MAX_CHUNK_BYTES", "16000")))
 
     try:
         with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
             while True:
                 now = time.time()
                 cmd.emergency_stop = False
+                voice_chunks_processed = 0
 
                 while True:
                     inbound = srv.session.poll()
@@ -426,6 +429,9 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                         continue
 
                     if mtype == "audio_chunk" and voice_recognizer.available:
+                        # Keep UI/control responsive under heavy audio traffic.
+                        if voice_chunks_processed >= max_voice_chunks_per_tick:
+                            continue
                         b64 = str(inbound.get("pcm16_b64", "") or "")
                         if b64:
                             try:
@@ -433,7 +439,11 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                             except Exception:
                                 pcm = b""
                             if pcm:
+                                if len(pcm) > max_voice_bytes:
+                                    # Keep freshest tail; drop old audio when backlog builds.
+                                    pcm = pcm[-max_voice_bytes:]
                                 cmd_from_voice = voice_recognizer.feed_chunk(pcm)
+                                voice_chunks_processed += 1
                                 if cmd_from_voice is not None:
                                     _apply_external_command(cmd, cmd_from_voice)
                                     set_message(f"Voice: {cmd_from_voice[0]}")
