@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import os
 import queue
@@ -54,6 +55,78 @@ from robot_net import JsonLineLink
 from rtsp_stream import RtspStreamConfig, RtspStreamPublisher
 from ui_layout import allocate_round_robin_heights
 from voice_control import AudioStreamClient, VoiceConfig
+
+
+def _prompt_select_one(
+    console: Console,
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    default_key: Optional[str] = None,
+) -> str:
+    if not options:
+        raise ValueError("options must not be empty")
+
+    keys = [k for k, _ in options]
+    if default_key is None or default_key not in keys:
+        default_key = options[0][0]
+
+    console.print(Panel(f"[bold]{title}[/]", border_style="bright_blue"))
+    for i, (key, desc) in enumerate(options, start=1):
+        default_tag = " [dim](default)[/]" if key == default_key else ""
+        console.print(f"  {i}. [bold]{key}[/] - {desc}{default_tag}")
+
+    while True:
+        raw = console.input(f"Select option [default: {default_key}]: ").strip()
+        if not raw:
+            return str(default_key)
+        low = raw.lower()
+        if low in keys:
+            return low
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        console.print("[yellow]Invalid choice. Enter number or key.[/]")
+
+
+def _prompt_select_checklist(
+    console: Console,
+    title: str,
+    options: list[tuple[str, str, str]],
+    *,
+    default_checked: Optional[set[str]] = None,
+) -> set[str]:
+    defaults = set(default_checked or set())
+    console.print(Panel(f"[bold]{title}[/]", border_style="bright_blue"))
+    for i, (key, label, desc) in enumerate(options, start=1):
+        default_tag = " [dim](default)[/]" if key in defaults else ""
+        console.print(f"  {i}. [bold]{label}[/] ({key}) - {desc}{default_tag}")
+    console.print("[dim]Enter comma-separated numbers/keys, 'none' for none, or press Enter for defaults.[/]")
+
+    by_key = {k: k for k, _, _ in options}
+    by_num = {str(i): k for i, (k, _, _) in enumerate(options, start=1)}
+
+    while True:
+        raw = console.input("Select optional features: ").strip().lower()
+        if not raw:
+            return set(defaults)
+        if raw in ("none", "off", "0"):
+            return set()
+
+        picked: set[str] = set()
+        ok = True
+        for part in [p.strip() for p in raw.split(",") if p.strip()]:
+            if part in by_num:
+                picked.add(by_num[part])
+            elif part in by_key:
+                picked.add(by_key[part])
+            else:
+                ok = False
+                break
+        if ok:
+            return picked
+        console.print("[yellow]Invalid selection. Use numbers/keys separated by commas.[/]")
 
 
 def _drain_pending_console_input() -> None:
@@ -1130,15 +1203,29 @@ def run_live_dashboard_tui(
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="HSEF robot client TUI")
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Use SSH-friendly startup prompts instead of keyboard-driven menus",
+    )
+    args = parser.parse_args()
+
     console = Console()
     _header(console)
+
+    select_one = _prompt_select_one if args.remote else _select_one
+    select_checklist = _prompt_select_checklist if args.remote else _select_checklist
+
+    if args.remote:
+        console.print(Panel("Remote setup mode enabled: using typed prompts for initial configuration.", border_style="bright_cyan"))
 
     # Configure peak up-front (before run/operation selection).
     console.print(Panel("Set session peak power (applies to live and test modes).", border_style="bright_blue"))
     peak_pct = IntPrompt.ask("Peak power %", default=65)
     peak = max(0.0, min(1.0, float(peak_pct) / 100.0))
 
-    mode = _select_one(
+    mode = select_one(
         console,
         "Run Mode",
         [
@@ -1149,7 +1236,7 @@ def main() -> int:
     dry_run = mode == "dry"
 
     _header(console)
-    action = _select_one(
+    action = select_one(
         console,
         "Operation",
         [
@@ -1159,7 +1246,7 @@ def main() -> int:
     )
 
     if action == "test":
-        cycles_choice = _select_one(
+        cycles_choice = select_one(
             console,
             "Cycles Per Motor",
             [
@@ -1176,7 +1263,7 @@ def main() -> int:
     _header(console)
     console.print(Panel("Motor control is required. Choose optional features:", border_style="bright_blue"))
 
-    picked = _select_checklist(
+    picked = select_checklist(
         console,
         "Optional Features",
         [
@@ -1196,7 +1283,7 @@ def main() -> int:
     # Optional network link (client can proceed even if disconnected)
     _header(console)
     console.print(Panel("Optional: connect to a server-side TUI for remote control/inference.", border_style="bright_blue"))
-    net_choice = _select_one(
+    net_choice = select_one(
         console,
         "Network Link",
         [
@@ -1226,7 +1313,7 @@ def main() -> int:
 
     mic_index: Optional[int] = None
     if features.voice:
-        ans = _select_one(
+        ans = select_one(
             console,
             "Microphone",
             [
