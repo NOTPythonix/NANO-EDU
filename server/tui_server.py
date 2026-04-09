@@ -403,6 +403,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
     last_analysis_tx = 0.0
     max_voice_chunks_per_tick = max(1, int(os.environ.get("ROBOT_VOICE_MAX_CHUNKS_PER_TICK", "2")))
     max_voice_bytes = max(2048, int(os.environ.get("ROBOT_VOICE_MAX_CHUNK_BYTES", "16000")))
+    voice_manual_latched = False
 
     try:
         with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
@@ -446,6 +447,11 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                                 voice_chunks_processed += 1
                                 if cmd_from_voice is not None:
                                     _apply_external_command(cmd, cmd_from_voice)
+                                    name = str(cmd_from_voice[0]).strip().lower()
+                                    if name in ("forward", "backward", "left", "right"):
+                                        voice_manual_latched = True
+                                    elif name in ("stop", "autonomous_on", "autonomous_off"):
+                                        voice_manual_latched = False
                                     set_message(f"Voice: {cmd_from_voice[0]}")
                         continue
 
@@ -466,6 +472,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                             cmd.autonomous = not cmd.autonomous
                             cmd.manual_throttle = 0.0
                             cmd.manual_steer = 0.0
+                            voice_manual_latched = False
                             set_message(f"Autonomous: {'ON' if cmd.autonomous else 'OFF'}")
                         elif k == "[":
                             cmd.max_speed_setting = max(0.0, cmd.max_speed_setting - 0.05)
@@ -500,6 +507,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                     cmd.autonomous = False
                     cmd.manual_throttle = 0.0
                     cmd.manual_steer = 0.0
+                    voice_manual_latched = False
                     set_message("Emergency stop.")
 
                 analysis_state = web_ui.get_latest_analysis() if web_ui else {}
@@ -531,9 +539,15 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                 if not cmd.autonomous:
                     throttle = (1.0 if "w" in pressed else 0.0) + (-1.0 if "s" in pressed else 0.0)
                     steer = (-1.0 if "a" in pressed else 0.0) + (1.0 if "d" in pressed else 0.0)
-                    cmd.manual_throttle = max(-1.0, min(1.0, throttle))
-                    cmd.manual_steer = max(-1.0, min(1.0, steer))
+                    if any(k in pressed for k in ("w", "a", "s", "d")):
+                        cmd.manual_throttle = max(-1.0, min(1.0, throttle))
+                        cmd.manual_steer = max(-1.0, min(1.0, steer))
+                        voice_manual_latched = False
+                    elif not voice_manual_latched:
+                        cmd.manual_throttle = 0.0
+                        cmd.manual_steer = 0.0
                 else:
+                    voice_manual_latched = False
                     # Server-side autonomous: use the latest detection result to drive.
                     if detection_result:
                         cmd.manual_throttle = max(-1.0, min(1.0, float(detection_result.get("throttle", 0.0))))
