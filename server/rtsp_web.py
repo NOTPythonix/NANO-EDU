@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import json
@@ -226,7 +226,7 @@ class RtspWebUi:
         detections_sorted = sorted(detections, key=lambda det: (-float(getattr(det, "confidence", 0.0) or 0.0), str(getattr(det, "label", ""))))
         all_detections = [
             {
-                "label": str(getattr(det, "label", "—")),
+                "label": str(getattr(det, "label", "ΓÇö")),
                 "confidence": round(float(getattr(det, "confidence", 0.0) or 0.0), 3),
                 "x1": int(getattr(det, "x1", 0) or 0),
                 "y1": int(getattr(det, "y1", 0) or 0),
@@ -243,7 +243,7 @@ class RtspWebUi:
             self._latest_detections = detections
             self._latest_analysis = {
                 "obstacle": str(getattr(analysis, "obstacle", "unknown")),
-                "label": str(getattr(analysis, "label", "—")),
+                "label": str(getattr(analysis, "label", "ΓÇö")),
                 "confidence": float(getattr(analysis, "confidence", 0.0) or 0.0),
                 "throttle": float(getattr(analysis, "throttle", 0.0) or 0.0),
                 "steer": float(getattr(analysis, "steer", 0.0) or 0.0),
@@ -656,39 +656,310 @@ class RtspWebUi:
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-    <title>Robot Stream Viewer</title>
+    <title>NANO-EDU Vision Terminal</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, Segoe UI, Arial; margin: 20px; background: #0b1220; color: #e6edf3; }
-    .card { background: #121c2e; border: 1px solid #23314f; border-radius: 12px; padding: 14px; }
-    .muted { color: #9fb0cd; }
-    img { width: 100%; max-width: 960px; border-radius: 8px; border: 1px solid #2c3f63; }
-    a { color: #8ec5ff; }
+        :root {
+            --bg: #0b0f0c;
+            --panel: #111612;
+            --line: #2a3a2d;
+            --text: #d9f7dc;
+            --muted: #8bb28f;
+            --ok: #7bff8a;
+            --warn: #ffe58a;
+            --bad: #ff8f8f;
+            --accent: #85ffbe;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Consolas, "Lucida Console", "Courier New", monospace;
+            padding: 14px;
+        }
+        .app {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            gap: 12px;
+        }
+        .hero,
+        .panel,
+        .status-card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 0;
+            box-shadow: none;
+        }
+        .hero {
+            padding: 10px 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .title { margin: 0; font-size: 1.1rem; letter-spacing: 0.04em; }
+        .subtitle { margin: 3px 0 0; color: var(--muted); font-size: 0.86rem; }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid var(--line);
+            padding: 4px 8px;
+            color: var(--muted);
+            background: #0e140f;
+            font-size: 0.82rem;
+        }
+        .dot { width: 8px; height: 8px; background: var(--warn); }
+        .dot.ok { background: var(--ok); }
+        .dot.bad { background: var(--bad); }
+        .grid {
+            display: grid;
+            grid-template-columns: minmax(300px, 1.7fr) minmax(250px, 1fr);
+            gap: 12px;
+        }
+        .panel { padding: 10px; }
+        .video-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            color: var(--muted);
+            font-size: 0.82rem;
+        }
+        .btn {
+            border: 1px solid var(--line);
+            background: #0f1711;
+            color: var(--accent);
+            font-family: inherit;
+            font-size: 0.78rem;
+            padding: 5px 8px;
+            cursor: pointer;
+        }
+        .btn:hover { background: #162119; }
+        .video-shell {
+            border: 1px solid var(--line);
+            background: #000;
+            width: 100%;
+            aspect-ratio: 16/9;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .video-shell:fullscreen {
+            width: 100vw;
+            height: 100vh;
+            aspect-ratio: auto;
+            margin: 0;
+            border: none;
+            background: #000;
+        }
+        .video-shell:fullscreen .feed {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .feed {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: cover;
+        }
+        .meta {
+            margin-top: 8px;
+            display: grid;
+            gap: 4px;
+            font-size: 0.82rem;
+            color: var(--muted);
+            word-break: break-all;
+        }
+        .meta a { color: var(--accent); text-decoration: none; }
+        .cards {
+            display: grid;
+            gap: 8px;
+            grid-template-columns: 1fr;
+        }
+        .status-card { padding: 8px 10px; }
+        .status-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.88rem;
+        }
+        .state {
+            border: 1px solid var(--line);
+            padding: 2px 6px;
+            color: var(--muted);
+            background: #0d140f;
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            white-space: nowrap;
+        }
+        .state.ok { color: #05220d; background: var(--ok); border-color: var(--ok); }
+        .state.warn { color: #2a1c00; background: var(--warn); border-color: var(--warn); }
+        .state.bad { color: #2e0505; background: var(--bad); border-color: var(--bad); }
+        .hint { margin-top: 5px; font-size: 0.8rem; color: var(--muted); }
+        .stats {
+            margin-top: 5px;
+            font-size: 0.78rem;
+            color: var(--muted);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        @media (max-width: 940px) {
+            .grid { grid-template-columns: 1fr; }
+        }
   </style>
 </head>
 <body>
-  <h2>Robot Camera Viewer</h2>
-  <div class=\"card\">
-    <p class=\"muted\">This web UI runs on the server and displays the client stream feed via MJPEG proxy.</p>
-    <p>Stream URL: <a id=\"rtsp\" href=\"#\" target=\"_blank\">(waiting)</a></p>
-    <p>Status: <span id=\"status\">starting…</span></p>
-    <img src=\"/mjpeg\" alt=\"Robot stream\" />
+    <div class=\"app\">
+        <section class=\"hero\">
+            <div>
+                <h1 class=\"title\">NANO-EDU VISION TERMINAL</h1>
+                <p class=\"subtitle\">server stream monitor + compliance status</p>
+            </div>
+            <div class=\"pill\"><span id=\"dot\" class=\"dot\"></span><span id=\"status\">starting...</span></div>
+        </section>
+
+        <section class=\"grid\">
+            <article class=\"panel\">
+                <div class=\"video-head\">
+                    <span>camera feed</span>
+                    <button id=\"fullscreen-btn\" class=\"btn\" type=\"button\">fullscreen video</button>
+                </div>
+                <div id=\"video-shell\" class=\"video-shell\">
+                    <img class=\"feed\" src=\"/mjpeg\" alt=\"Robot stream\" />
+                </div>
+                <div class=\"meta\">
+                    <div>client stream: <a id=\"rtsp\" href=\"#\" target=\"_blank\">(waiting)</a></div>
+                    <div>model: <span id=\"model\">loading...</span></div>
+                    <div>analysis fps: <span id=\"fps\">--</span></div>
+                </div>
+            </article>
+
+            <article class=\"panel cards\">
+                <div class=\"status-card\">
+                    <div class=\"status-head\"><span>uniform wordmark</span><span id=\"uniform-state\" class=\"state\">...</span></div>
+                    <div id=\"uniform-hint\" class=\"hint\">waiting for detections...</div>
+                    <div class=\"stats\"><span>person close: <strong id=\"uniform-person\">--</strong></span><span>age: <strong id=\"uniform-age\">--</strong></span></div>
+                </div>
+
+                <div class=\"status-card\">
+                    <div class=\"status-head\"><span>id badge</span><span id=\"badge-state\" class=\"state\">...</span></div>
+                    <div id=\"badge-hint\" class=\"hint\">waiting for detections...</div>
+                    <div class=\"stats\"><span>person medium: <strong id=\"badge-person\">--</strong></span><span>age: <strong id=\"badge-age\">--</strong></span></div>
+                </div>
+
+                <div class=\"status-card\">
+                    <div class=\"status-head\"><span>phone</span><span id=\"phone-state\" class=\"state\">...</span></div>
+                    <div id=\"phone-hint\" class=\"hint\">waiting for detections...</div>
+                    <div class=\"stats\"><span>person medium: <strong id=\"phone-person\">--</strong></span><span>age: <strong id=\"phone-age\">--</strong></span></div>
+                </div>
+            </article>
+        </section>
   </div>
   <script>
+        function ageText(v) {
+            if (v === null || v === undefined) return '--';
+            const n = Number(v);
+            return Number.isFinite(n) ? (n.toFixed(1) + 's') : '--';
+        }
+
+        function setState(baseId, kind, text, hint, age, personText) {
+            const stateEl = document.getElementById(baseId + '-state');
+            stateEl.className = 'state ' + kind;
+            stateEl.textContent = text;
+            document.getElementById(baseId + '-hint').textContent = hint;
+            document.getElementById(baseId + '-age').textContent = age;
+            document.getElementById(baseId + '-person').textContent = personText;
+        }
+
+        function renderCompliance(a) {
+            const hasMedium = !!a.person_medium_close;
+            const hasClose = !!a.person_close;
+            const phoneDetected = !!a.phone_detected;
+            const badgeDetected = !!a.badge_detected;
+            const uniformDetected = !!a.wordmark_detected;
+
+            if (uniformDetected) {
+                setState('uniform', 'ok', 'detected', 'wordmark detected on close-range person.', ageText(a.wordmark_detected_age_s), hasClose ? 'yes' : 'no');
+            } else if (!hasClose) {
+                setState('uniform', 'warn', 'too far', 'no close-range person for uniform check yet.', ageText(a.wordmark_detected_age_s), 'no');
+            } else {
+                setState('uniform', 'bad', 'not detected', 'close-range person seen, no wordmark detected.', ageText(a.wordmark_detected_age_s), 'yes');
+            }
+
+            if (badgeDetected) {
+                setState('badge', 'ok', 'detected', 'id badge detected.', ageText(a.badge_detected_age_s), hasMedium ? 'yes' : 'no');
+            } else if (!hasMedium) {
+                setState('badge', 'warn', 'too far', 'no medium-range person for badge check yet.', ageText(a.badge_detected_age_s), 'no');
+            } else {
+                setState('badge', 'bad', 'not detected', 'medium-range person seen, no badge detected.', ageText(a.badge_detected_age_s), 'yes');
+            }
+
+            if (phoneDetected) {
+                setState('phone', 'bad', 'detected', 'phone detected in scene.', ageText(a.phone_detected_age_s), hasMedium ? 'yes' : 'no');
+            } else if (!hasMedium) {
+                setState('phone', 'warn', 'too far', 'no medium-range person for phone check yet.', ageText(a.phone_detected_age_s), 'no');
+            } else {
+                setState('phone', 'ok', 'not detected', 'no phone detected on medium-range subject.', ageText(a.phone_detected_age_s), 'yes');
+            }
+        }
+
         async function refresh() {
             try {
-                const statusResp = await fetch('/status', { cache: 'no-store' });
+                const [statusResp, analysisResp] = await Promise.all([
+                    fetch('/status', { cache: 'no-store' }),
+                    fetch('/analysis', { cache: 'no-store' }),
+                ]);
                 const s = await statusResp.json();
-                const text = s.last_error ? ('error: ' + s.last_error) : (s.has_frame ? ('ok, frame age ' + s.frame_age_s + 's') : 'waiting for frames');
+                const a = await analysisResp.json();
+
+                const dot = document.getElementById('dot');
+                let text = 'waiting for frames';
+                dot.className = 'dot';
+                if (s.last_error) {
+                    text = 'error: ' + s.last_error;
+                    dot.className = 'dot bad';
+                } else if (s.has_frame) {
+                    text = 'live, frame age ' + s.frame_age_s + 's';
+                    dot.className = 'dot ok';
+                }
                 document.getElementById('status').textContent = text;
+
                 const rtspLink = document.getElementById('rtsp');
                 if (s.rtsp_url) {
                     rtspLink.textContent = s.rtsp_url;
                     rtspLink.href = s.rtsp_url;
                 }
+
+                document.getElementById('model').textContent = a.model_path || 'loading...';
+                document.getElementById('fps').textContent = (a.analysis_fps !== undefined && a.analysis_fps !== null)
+                    ? Number(a.analysis_fps).toFixed(2)
+                    : '--';
+                renderCompliance(a || {});
             } catch (_) {
                 document.getElementById('status').textContent = 'status unavailable';
+                document.getElementById('dot').className = 'dot bad';
             }
         }
+
+        function toggleVideoFullscreen() {
+            const shell = document.getElementById('video-shell');
+            if (!document.fullscreenElement) {
+                if (shell.requestFullscreen) {
+                    shell.requestFullscreen().catch(() => {});
+                }
+            } else if (document.exitFullscreen) {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+
+        document.getElementById('fullscreen-btn').addEventListener('click', toggleVideoFullscreen);
     setInterval(refresh, 1000);
     refresh();
   </script>
@@ -739,3 +1010,4 @@ class RtspWebUi:
                         return
 
         return Handler
+

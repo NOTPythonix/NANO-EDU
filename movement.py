@@ -265,6 +265,8 @@ def mix_throttle_steer(
 ) -> Tuple[float, float]:
     throttle = max(-1.0, min(1.0, float(throttle)))
     steer = max(-1.0, min(1.0, float(steer)))
+    # Hardware orientation is mirrored on this robot; invert steering globally.
+    steer = -steer
     speed_setting = max(0.0, min(1.0, float(speed_setting)))
 
     if full_speed:
