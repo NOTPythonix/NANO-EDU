@@ -5,10 +5,15 @@ This robot will help in lots of schools around the globe!
 
 ## Run
 
+### First-time setup
+
+- On Linux / DietPi:
+	- `bash install.sh`
+
 ### Client (Robot / Pi)
 
 - Run the robot TUI:
-	- `python tui_client.py`
+	- `bash start.sh`
 
 The client can optionally connect to the server-side TUI for remote driving and server-side autonomy.
 
