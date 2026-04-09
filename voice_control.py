@@ -218,3 +218,177 @@ class VoiceController:
 
         candidates.sort(key=lambda item: item[0])
         return candidates[-1][1]
+
+
+class AudioStreamClient:
+    """Capture PCM16 mono audio chunks for network streaming (no local recognition)."""
+
+    def __init__(self, cfg: VoiceConfig):
+        self._cfg = cfg
+        self._sd = None
+        self._stream = None
+        self._audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=12)
+        self.last_error: str = ""
+        self._last_chunk_ts: Optional[float] = None
+
+        try:
+            import sounddevice as sd  # type: ignore
+
+            self._sd = sd
+            self.last_error = ""
+        except Exception as e:
+            self._sd = None
+            self.last_error = f"audio init failed: {e}"
+
+    @property
+    def available(self) -> bool:
+        return bool(self._sd is not None)
+
+    @property
+    def sample_rate(self) -> int:
+        return int(self._cfg.sample_rate)
+
+    @property
+    def last_chunk_ts(self) -> Optional[float]:
+        return self._last_chunk_ts
+
+    def start(self) -> None:
+        if not self.available:
+            if not self.last_error:
+                self.last_error = "audio unavailable"
+            return
+        try:
+            if self._stream is not None:
+                return
+
+            def callback(indata, frames, time_info, status) -> None:
+                if status:
+                    self.last_error = f"audio status: {status}"
+                try:
+                    self._audio_q.put_nowait(bytes(indata))
+                    self._last_chunk_ts = time.time()
+                except queue.Full:
+                    # Keep freshest audio by dropping oldest chunk first.
+                    try:
+                        _ = self._audio_q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        self._audio_q.put_nowait(bytes(indata))
+                        self._last_chunk_ts = time.time()
+                    except Exception:
+                        pass
+
+            self._stream = self._sd.RawInputStream(
+                samplerate=float(self._cfg.sample_rate),
+                blocksize=int(self._cfg.blocksize),
+                device=self._cfg.mic_device_index,
+                dtype="int16",
+                channels=1,
+                callback=callback,
+            )
+            self._stream.start()
+            self.last_error = ""
+        except Exception as e:
+            self.stop()
+            self.last_error = f"audio start failed: {e}"
+
+    def stop(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def poll_chunks(self, *, max_chunks: int = 4) -> list[bytes]:
+        out: list[bytes] = []
+        limit = max(1, int(max_chunks))
+        for _ in range(limit):
+            try:
+                out.append(self._audio_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
+class ServerVoiceRecognizer:
+    """Server-side Vosk recognizer fed by streamed PCM16 chunks."""
+
+    def __init__(self, cfg: VoiceConfig):
+        self._cfg = cfg
+        self._recognizer = None
+        self._lock = threading.Lock()
+        self._last_text: Optional[str] = None
+        self._last_cmd: Optional[Command] = None
+        self._last_ts: Optional[float] = None
+        self._last_emitted_cmd: Optional[Command] = None
+        self.last_error: str = ""
+
+        try:
+            from vosk import KaldiRecognizer, Model  # type: ignore
+
+            model_path = Path(cfg.model_path) if cfg.model_path else DEFAULT_MODEL_PATH
+            if not model_path.exists():
+                raise FileNotFoundError(f"model not found: {model_path}")
+
+            model = Model(str(model_path))
+            self._recognizer = KaldiRecognizer(model, float(cfg.sample_rate))
+            self._recognizer.SetWords(True)
+            self.last_error = ""
+        except Exception as e:
+            self._recognizer = None
+            self.last_error = f"vosk init failed: {e}"
+
+    @property
+    def available(self) -> bool:
+        return self._recognizer is not None
+
+    def feed_chunk(self, data: bytes) -> Optional[Command]:
+        rec = self._recognizer
+        if rec is None or not data:
+            return None
+
+        try:
+            rec.AcceptWaveform(data)
+
+            # Prefer final result text when available, otherwise use partial.
+            final_txt = ""
+            partial_txt = ""
+            try:
+                final_txt = str(json.loads(rec.Result()).get("text", "") or "").strip()
+            except Exception:
+                final_txt = ""
+            try:
+                partial_txt = str(json.loads(rec.PartialResult()).get("partial", "") or "").strip()
+            except Exception:
+                partial_txt = ""
+
+            text = final_txt or partial_txt
+            if text:
+                with self._lock:
+                    self._last_text = _tail_words(text)
+                    self._last_ts = time.time()
+
+            cmd = VoiceController.parse_command(text) if text else None
+            if cmd:
+                with self._lock:
+                    self._last_cmd = cmd
+                    self._last_ts = time.time()
+                if cmd != self._last_emitted_cmd:
+                    self._last_emitted_cmd = cmd
+                    return cmd
+
+            self.last_error = ""
+            return None
+        except Exception as e:
+            self.last_error = f"voice callback failed: {e}"
+            return None
+
+    def last_event(self) -> tuple[str | None, Command | None, float | None]:
+        with self._lock:
+            return self._last_text, self._last_cmd, self._last_ts

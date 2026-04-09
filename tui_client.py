@@ -53,7 +53,7 @@ from movement import DriveConfig, Motor, SkidSteerDrive, build_motors, load_moto
 from robot_net import JsonLineLink
 from rtsp_stream import RtspStreamConfig, RtspStreamPublisher
 from ui_layout import allocate_round_robin_heights
-from voice_control import VoiceConfig, VoiceController
+from voice_control import AudioStreamClient, VoiceConfig
 
 
 def _drain_pending_console_input() -> None:
@@ -378,12 +378,11 @@ def run_live_dashboard_tui(
     keys.start()
 
     state = RuntimeState(speed_setting=max(0.0, min(1.0, float(peak))), max_speed_setting=max(0.0, min(1.0, float(peak))))
-    voice_q: "queue.Queue[Tuple[str, Optional[int]]]" = queue.Queue()
     ir_q: "queue.Queue[Tuple[str, Optional[int]]]" = queue.Queue()
 
-    vc = VoiceController(voice_q, VoiceConfig(mic_device_index=mic_index)) if features.voice else None
-    if vc and vc.available:
-        vc.start()
+    audio_streamer = AudioStreamClient(VoiceConfig(mic_device_index=mic_index)) if features.voice else None
+    if audio_streamer and audio_streamer.available:
+        audio_streamer.start()
 
     irc = None
     cam: Optional[CameraController] = None
@@ -615,22 +614,16 @@ def run_live_dashboard_tui(
 
     def voice_panel() -> Panel:
         enabled = bool(features.voice)
-        available = bool(vc and vc.available)
-        voice_err = str(getattr(vc, "last_error", "") or "") if vc else ""
-        last_text = None
-        last_cmd = None
-        last_ts = None
-        if vc and hasattr(vc, "last_event"):
-            try:
-                last_text, last_cmd, last_ts = vc.last_event()
-            except Exception:
-                pass
+        available = bool(audio_streamer and audio_streamer.available)
+        voice_err = str(getattr(audio_streamer, "last_error", "") or "") if audio_streamer else ""
+        last_ts = audio_streamer.last_chunk_ts if audio_streamer else None
         rows = [
             ("Enabled", ui_on_off(enabled)),
             ("Available", ui_on_off(available)),
+            ("Recognition", "[cyan]Server-side[/]" if available else "—"),
             ("Voice err", _ellipsize(voice_err or "—", 30)),
-            ("Last words", last_text or "—"),
-            ("Parsed cmd", f"{last_cmd[0]}" if last_cmd else "—"),
+            ("Last words", "—"),
+            ("Parsed cmd", "—"),
             ("Applied cmd", f"{last_voice_cmd[0]}" if last_voice_cmd else "—"),
             ("Age", age_s(last_ts or last_voice_ts)),
         ]
@@ -858,28 +851,6 @@ def run_live_dashboard_tui(
                     else:
                         last_mode = "remote"
 
-                    if vc:
-                        try:
-                            while True:
-                                cmd = voice_q.get_nowait()
-                                if remote_active and link is not None and cmd[0] in ("autonomous_on", "autonomous_off"):
-                                    try:
-                                        link.send({"type": "client_request", "request": cmd[0], "ts": time.time()})
-                                        message = f"Voice request sent: {cmd[0]}"
-                                    except Exception:
-                                        _apply_external_command(state, cmd)
-                                elif cmd[0] == "stop":
-                                    _apply_external_command(state, cmd)
-                                    trigger_emergency_stop("Emergency stop.")
-                                else:
-                                    _apply_external_command(state, cmd)
-                                last_voice_cmd = cmd
-                                last_voice_ts = time.time()
-                                if not (remote_active and cmd[0] in ("autonomous_on", "autonomous_off")):
-                                    message = f"Voice: {cmd[0]}"
-                        except queue.Empty:
-                            pass
-
                     if irc:
                         try:
                             while True:
@@ -890,15 +861,6 @@ def run_live_dashboard_tui(
                                 message = f"IR: {cmd[0]}"
                         except queue.Empty:
                             pass
-
-                    remote_thr = float(remote_state.get("manual_throttle", 0.0)) if isinstance(remote_state, dict) else 0.0
-                    remote_str = float(remote_state.get("manual_steer", 0.0)) if isinstance(remote_state, dict) else 0.0
-                    remote_auto = bool(remote_state.get("autonomous", False)) if isinstance(remote_state, dict) else False
-                    server_is_actively_commanding = bool(remote_active and (remote_auto or abs(remote_thr) > 1e-3 or abs(remote_str) > 1e-3))
-
-                    if not server_is_actively_commanding and not any(k in pressed for k in ("w", "a", "s", "d")) and state.voice_active:
-                        state.manual_throttle = float(state.voice_throttle)
-                        state.manual_steer = float(state.voice_steer)
 
                     target_left, target_right = mix_throttle_steer(
                         state.manual_throttle,
@@ -922,7 +884,7 @@ def run_live_dashboard_tui(
                 error_messages.feed("client.network", net_err, now_s=now, prefix="[c]", priority=0, label="Network")
                 error_messages.feed("client.camera", (getattr(cam, "last_error", "") if cam else ""), now_s=now, prefix="[c]", priority=0, label="Camera")
                 error_messages.feed("client.stream", (str(rtsp_pub.last_error) if rtsp_pub else ""), now_s=now, prefix="[c]", priority=0, label="Stream")
-                error_messages.feed("client.voice", (getattr(vc, "last_error", "") if vc else ""), now_s=now, prefix="[c]", priority=0, label="Voice")
+                error_messages.feed("client.voice", (getattr(audio_streamer, "last_error", "") if audio_streamer else ""), now_s=now, prefix="[c]", priority=0, label="Voice")
                 message, message_until = error_messages.next_message(now_s=now, current=message, current_until=message_until, ready="Ready.")
 
                 if cam and cam.available and features.camera:
@@ -943,6 +905,23 @@ def run_live_dashboard_tui(
                                     pass
                             last_frame_tx = now
                             frames_sent += 1
+
+                if audio_streamer and audio_streamer.available:
+                    if link is not None and link.stats.connected:
+                        for chunk in audio_streamer.poll_chunks(max_chunks=3):
+                            try:
+                                link.send(
+                                    {
+                                        "type": "audio_chunk",
+                                        "ts": now,
+                                        "sample_rate": int(audio_streamer.sample_rate),
+                                        "pcm16_b64": base64.b64encode(chunk).decode("ascii"),
+                                    }
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        _ = audio_streamer.poll_chunks(max_chunks=3)
 
                 if link is not None and link.stats.connected and (now - last_telemetry_tx) >= 0.10:
                     try:
@@ -977,22 +956,14 @@ def run_live_dashboard_tui(
 
                         voice_info: dict[str, Any] = {
                             "enabled": bool(features.voice),
-                            "available": bool(vc and vc.available),
-                            "error": (str(getattr(vc, "last_error", "") or "—") if vc else "—"),
+                            "available": bool(audio_streamer and audio_streamer.available),
+                            "error": (str(getattr(audio_streamer, "last_error", "") or "—") if audio_streamer else "—"),
+                            "last_words": "—",
+                            "parsed": "—",
+                            "applied": (last_voice_cmd[0] if last_voice_cmd else "—"),
+                            "age": age_s(audio_streamer.last_chunk_ts if audio_streamer else None),
+                            "source": "stream_to_server",
                         }
-                        if vc and hasattr(vc, "last_event"):
-                            try:
-                                last_text, last_cmd, last_ts = vc.last_event()  # type: ignore[attr-defined]
-                                voice_info.update(
-                                    {
-                                        "last_words": last_text or "—",
-                                        "parsed": (last_cmd[0] if last_cmd else "—"),
-                                        "applied": (last_voice_cmd[0] if last_voice_cmd else "—"),
-                                        "age": age_s(last_ts or last_voice_ts),
-                                    }
-                                )
-                            except Exception:
-                                pass
 
                         ir_info: dict[str, Any] = {
                             "enabled": bool(features.ir),
@@ -1052,7 +1023,7 @@ def run_live_dashboard_tui(
                                     ],
                                     "voice": [
                                         {"k": "Enabled", "v": ui_on_off(bool(features.voice))},
-                                        {"k": "Available", "v": ui_on_off(bool(vc and vc.available))},
+                                        {"k": "Available", "v": ui_on_off(bool(audio_streamer and audio_streamer.available))},
                                         {"k": "Voice err", "v": _ellipsize(str(voice_info.get("error", "—")), 30)},
                                         {"k": "Last words", "v": str(voice_info.get("last_words", "—"))},
                                         {"k": "Parsed cmd", "v": str(voice_info.get("parsed", "—"))},
@@ -1134,8 +1105,8 @@ def run_live_dashboard_tui(
         except Exception:
             pass
         try:
-            if vc:
-                vc.stop()
+            if audio_streamer:
+                audio_streamer.stop()
         except Exception:
             pass
         try:
@@ -1209,7 +1180,7 @@ def main() -> int:
         console,
         "Optional Features",
         [
-            ("voice", "Voice", "Voice control (Vosk + sounddevice)"),
+            ("voice", "Voice", "Voice input stream to server (Vosk runs on server)"),
             ("camera", "Camera", "Obstacle detection (OpenCV)"),
         ],
         default_checked=set(),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ else:
 
 from server.net_server import JsonLineRobotServer
 from server.rtsp_web import RtspWebUi
+from voice_control import ServerVoiceRecognizer, VoiceConfig
 from tui import (
     DetectionPageUiState,
     ErrorMessageQueue,
@@ -73,6 +75,46 @@ def _fmt_when(now: float, ts: Optional[float]) -> str:
     return f"{stamp} ({_age_s(now, ts)} ago)"
 
 
+def _apply_external_command(cmd: ServerCmdState, command: tuple[str, Optional[int]]) -> None:
+    name, val = command
+    if name == "forward":
+        cmd.autonomous = False
+        cmd.manual_throttle = 1.0
+        cmd.manual_steer = 0.0
+        return
+    if name == "backward":
+        cmd.autonomous = False
+        cmd.manual_throttle = -1.0
+        cmd.manual_steer = 0.0
+        return
+    if name == "left":
+        cmd.autonomous = False
+        cmd.manual_steer = -1.0
+        return
+    if name == "right":
+        cmd.autonomous = False
+        cmd.manual_steer = 1.0
+        return
+    if name == "stop":
+        cmd.autonomous = False
+        cmd.emergency_stop = True
+        cmd.manual_throttle = 0.0
+        cmd.manual_steer = 0.0
+        return
+    if name == "autonomous_on":
+        cmd.autonomous = True
+        cmd.manual_throttle = 0.0
+        cmd.manual_steer = 0.0
+        return
+    if name == "autonomous_off":
+        cmd.autonomous = False
+        cmd.manual_throttle = 0.0
+        cmd.manual_steer = 0.0
+        return
+    if name == "speed" and isinstance(val, int):
+        cmd.speed_setting = max(0.0, min(cmd.max_speed_setting, float(val) / 100.0))
+
+
 def wait_for_robot(console: Console, srv: JsonLineRobotServer) -> None:
     keys = KeyboardKeys()
     keys.start()
@@ -110,6 +152,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
     keys.start()
 
     cmd = ServerCmdState()
+    voice_recognizer = ServerVoiceRecognizer(VoiceConfig())
     start_t = time.time()
 
     TOP_SIZE = 3
@@ -307,16 +350,20 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
 
     def voice_panel(tlm: dict[str, Any]) -> Panel:
         v = tlm.get("voice") or {}
+        last_text, last_cmd, last_ts = voice_recognizer.last_event()
+        server_available = bool(voice_recognizer.available)
+        server_error = str(getattr(voice_recognizer, "last_error", "") or "")
         rows = [
             ("Enabled", ui_on_off(bool(v.get("enabled", False)))),
-            ("Available", ui_on_off(bool(v.get("available", False)))),
-            ("Last words", str(v.get("last_words", "—"))),
-            ("Parsed cmd", str(v.get("parsed", "—"))),
-            ("Applied cmd", str(v.get("applied", "—"))),
-            ("Age", str(v.get("age", "—"))),
+            ("Available", ui_on_off(server_available)),
+            ("Source", "[cyan]Server Vosk[/]" if server_available else "—"),
+            ("Voice err", server_error or str(v.get("error", "—"))),
+            ("Last words", str(last_text or "—")),
+            ("Parsed cmd", str(last_cmd[0] if last_cmd else "—")),
+            ("Applied cmd", str(last_cmd[0] if last_cmd else "—")),
+            ("Age", _age_s(time.time(), last_ts)),
         ]
-        rows = _rows_from_ui(tlm, "voice", [(k, str(vv)) for k, vv in rows])
-        on = bool(v.get("enabled", False)) and bool(v.get("available", False))
+        on = bool(v.get("enabled", False)) and server_available
         return _scrollable_panel("voice", "Voice", "green" if on else "red", rows)
 
     def camera_panel(now: float, tlm: dict[str, Any]) -> Panel:
@@ -359,6 +406,7 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
         with Live(layout, console=console, refresh_per_second=20, screen=True) as live:
             while True:
                 now = time.time()
+                cmd.emergency_stop = False
 
                 while True:
                     inbound = srv.session.poll()
@@ -366,19 +414,30 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                         break
                     if not isinstance(inbound, dict):
                         continue
-                    if str(inbound.get("type", "")) != "client_request":
+                    mtype = str(inbound.get("type", "")).strip().lower()
+                    if mtype == "client_request":
+                        req = str(inbound.get("request", "")).strip().lower()
+                        if req == "autonomous_on":
+                            _apply_external_command(cmd, ("autonomous_on", None))
+                            set_message("Client requested autonomous ON")
+                        elif req == "autonomous_off":
+                            _apply_external_command(cmd, ("autonomous_off", None))
+                            set_message("Client requested autonomous OFF")
                         continue
-                    req = str(inbound.get("request", "")).strip().lower()
-                    if req == "autonomous_on":
-                        cmd.autonomous = True
-                        cmd.manual_throttle = 0.0
-                        cmd.manual_steer = 0.0
-                        set_message("Client voice requested autonomous ON")
-                    elif req == "autonomous_off":
-                        cmd.autonomous = False
-                        cmd.manual_throttle = 0.0
-                        cmd.manual_steer = 0.0
-                        set_message("Client voice requested autonomous OFF")
+
+                    if mtype == "audio_chunk" and voice_recognizer.available:
+                        b64 = str(inbound.get("pcm16_b64", "") or "")
+                        if b64:
+                            try:
+                                pcm = base64.b64decode(b64)
+                            except Exception:
+                                pcm = b""
+                            if pcm:
+                                cmd_from_voice = voice_recognizer.feed_chunk(pcm)
+                                if cmd_from_voice is not None:
+                                    _apply_external_command(cmd, cmd_from_voice)
+                                    set_message(f"Voice: {cmd_from_voice[0]}")
+                        continue
 
                 while True:
                     ev = keys.poll_event()
@@ -426,7 +485,6 @@ def run_dashboard(console: Console, srv: JsonLineRobotServer, *, web_ui: Optiona
                 if "esc" in pressed:
                     break
 
-                cmd.emergency_stop = False
                 if "space" in pressed:
                     cmd.emergency_stop = True
                     cmd.autonomous = False
